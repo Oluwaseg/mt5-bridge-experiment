@@ -27,6 +27,24 @@ docker run --rm -p 8000:8000 mt5-bridge-experiment
 
 The health endpoint is `GET /health`.
 
+## Test another MT5 broker locally
+
+Copy `.env.example` to `.env` and fill in the broker account credentials:
+
+```text
+MT5_LOGIN=1048288
+MT5_PASSWORD=your-demo-password
+MT5_SERVER=Capital.com-Demo
+```
+
+Keep `.env` local; it is ignored by Git. Restart the bridge after changing
+the account, then verify `GET /health` reports the expected `server`,
+`company`, and `accountLogin`. Do not place orders until those values match
+the intended demo account.
+
+If all three credential fields are empty, the bridge uses the account already
+logged into the installed MT5 terminal.
+
 ## Northflank gate
 
 Deploy this image as a private continuously running service. Do not add it to the production Node service yet. The experiment passes only when Wine, the terminal, and the Python package all remain healthy after restart.

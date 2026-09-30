@@ -1,3 +1,3 @@
 # The official package must be tested with a Windows Python runtime or a
 # Windows Python runtime under Wine. It is not assumed to be Linux-compatible.
-MetaTrader5==5.0.5517
+MetaTrader5==5.0.6180
