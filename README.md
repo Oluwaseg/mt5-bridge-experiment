@@ -27,6 +27,13 @@ docker run --rm -p 8000:8000 mt5-bridge-experiment
 
 The health endpoint is `GET /health`.
 
+The probe also exposes `POST /position-protection` for demo accounts. It
+modifies an existing ticket's native MT5 stop-loss and take-profit price levels;
+initial order risk/target amounts are converted using the symbol's tick values.
+The application's `10s (ticks)` timeframe is synthesized from tick history on
+both Deriv and MT5 because neither broker candle endpoint exposes native
+10-second OHLC bars. Its accuracy depends on tick availability and polling.
+
 ## Test another MT5 broker locally
 
 Copy `.env.example` to `.env` and fill in the broker account credentials:

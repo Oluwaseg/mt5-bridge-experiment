@@ -1,5 +1,8 @@
 import importlib.util
 import os
+import re
+from datetime import datetime, timedelta, timezone
+
 from flask import Flask, jsonify, request
 from dotenv import load_dotenv
 
@@ -47,6 +50,88 @@ def initialize_mt5(mt5):
             server=configured["server"],
         )
     return mt5.initialize(**initialize_kwargs)
+
+
+def protection_price(info, entry_price, side, volume, amount, is_take_profit):
+    if amount <= 0:
+        return 0.0
+    tick_size = float(getattr(info, "trade_tick_size", 0) or 0)
+    tick_value_key = "trade_tick_value_profit" if is_take_profit else "trade_tick_value_loss"
+    tick_value = float(
+        getattr(info, tick_value_key, 0)
+        or getattr(info, "trade_tick_value", 0)
+        or 0
+    )
+    if tick_size <= 0 or tick_value <= 0 or volume <= 0:
+        raise ValueError("Symbol tick value is unavailable for risk conversion")
+
+    distance = amount * tick_size / (tick_value * volume)
+    moves_with_position = (side == "BUY") == is_take_profit
+    sign = 1 if moves_with_position else -1
+    price = entry_price + sign * distance
+    rounded_to_tick = round(price / tick_size) * tick_size
+    return round(rounded_to_tick, int(info.digits))
+
+
+def aggregate_mt5_ticks(ticks, timeframe_seconds, maximum_candles):
+    duration = int(timeframe_seconds)
+    limit = max(2, int(maximum_candles))
+    buckets = {}
+
+    def value(tick, key, default=0):
+        try:
+            return tick[key]
+        except (KeyError, IndexError, TypeError, ValueError):
+            return default
+
+    tick_rows = ticks if ticks is not None else ()
+    ordered_ticks = sorted(
+        tick_rows, key=lambda tick: int(value(tick, "time"))
+    )
+
+    for tick in ordered_ticks:
+        timestamp = int(value(tick, "time"))
+        price = float(value(tick, "last") or value(tick, "bid") or 0)
+        if price <= 0:
+            continue
+        epoch = timestamp // duration * duration
+        candle = buckets.get(epoch)
+        if candle is None:
+            buckets[epoch] = {
+                "epoch": epoch,
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "volume": int(value(tick, "volume") or 0),
+            }
+        else:
+            candle["high"] = max(candle["high"], price)
+            candle["low"] = min(candle["low"], price)
+            candle["close"] = price
+            candle["volume"] += int(value(tick, "volume") or 0)
+
+    populated = [buckets[epoch] for epoch in sorted(buckets)]
+    candles = []
+    previous = None
+    for candle in populated:
+        if previous is not None:
+            gap = (candle["epoch"] - previous["epoch"]) // duration - 1
+            if 0 < gap <= limit:
+                for index in range(1, gap + 1):
+                    epoch = previous["epoch"] + index * duration
+                    candles.append({
+                        "epoch": epoch,
+                        "open": previous["close"],
+                        "high": previous["close"],
+                        "low": previous["close"],
+                        "close": previous["close"],
+                        "volume": 0,
+                    })
+        candles.append(candle)
+        previous = candle
+
+    return candles[-limit:]
 
 
 @app.get("/health")
@@ -216,6 +301,28 @@ def candles(symbol):
     timeframe = request.args.get("timeframe", "1m")
     count = min(max(int(request.args.get("count", 300)), 2), 5000)
     try:
+        seconds_match = re.fullmatch(r"(\d+)s", timeframe)
+        if seconds_match:
+            timeframe_seconds = int(seconds_match.group(1))
+            if timeframe_seconds < 1 or timeframe_seconds >= 60:
+                return jsonify({"error": "Second timeframe must be between 1s and 59s"}), 400
+            if not mt5.symbol_select(symbol, True):
+                return jsonify({"error": "Unsupported symbol", "symbol": symbol}), 400
+            tick_count = min(max(count * 20, 1000), 50000)
+            start_time = datetime.now(timezone.utc) - timedelta(
+                seconds=timeframe_seconds * count * 3
+            )
+            ticks = mt5.copy_ticks_from(
+                symbol, start_time, tick_count, mt5.COPY_TICKS_ALL
+            )
+            return jsonify({
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "candles": aggregate_mt5_ticks(
+                    ticks, timeframe_seconds, count
+                ),
+            })
+
         if timeframe not in timeframes or not mt5.symbol_select(symbol, True):
             return jsonify({"error": "Unsupported timeframe or symbol", "symbol": symbol}), 400
         rates = mt5.copy_rates_from_pos(symbol, timeframes[timeframe], 0, count)
@@ -318,16 +425,38 @@ def demo_order_send():
     if volume <= 0 or volume > 0.01:
         return jsonify({"error": "demo order volume must be between 0 and 0.01"}), 400
 
+    try:
+        stop_loss_amount = float(payload.get("stopLoss", 0) or 0)
+        take_profit_amount = float(payload.get("takeProfit", 0) or 0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "stopLoss and takeProfit must be numeric"}), 400
+    if stop_loss_amount < 0 or take_profit_amount < 0:
+        return jsonify({"error": "stopLoss and takeProfit cannot be negative"}), 400
+
     mt5 = load_mt5()
     if mt5 is None or not initialize_mt5(mt5):
         error = str(mt5.last_error()) if mt5 is not None else "MetaTrader5 package is unavailable"
         return jsonify({"error": "MT5 initialization failed", "details": error}), 503
 
     try:
+        account = mt5.account_info()
+        if account is None or account.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO:
+            return jsonify({"error": "Order execution is demo-account only"}), 403
         info = mt5.symbol_info(symbol)
         tick = mt5.symbol_info_tick(symbol)
         if info is None or tick is None:
             return jsonify({"error": "symbol or tick data unavailable", "symbol": symbol}), 404
+
+        entry_price = tick.ask if side == "BUY" else tick.bid
+        try:
+            stop_loss_price = protection_price(
+                info, entry_price, side, volume, stop_loss_amount, False
+            )
+            take_profit_price = protection_price(
+                info, entry_price, side, volume, take_profit_amount, True
+            )
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 422
 
         order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
         if info.filling_mode & 2:
@@ -341,7 +470,9 @@ def demo_order_send():
             "symbol": symbol,
             "volume": volume,
             "type": order_type,
-            "price": tick.ask if side == "BUY" else tick.bid,
+            "price": entry_price,
+            "sl": stop_loss_price,
+            "tp": take_profit_price,
             "deviation": 20,
             "magic": 26092401,
             "comment": "phase-0-demo-order",
@@ -385,6 +516,9 @@ def demo_position_close():
         return jsonify({"error": "MT5 initialization failed", "details": error}), 503
 
     try:
+        account = mt5.account_info()
+        if account is None or account.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO:
+            return jsonify({"error": "Position protection updates are demo-account only"}), 403
         matches = mt5.positions_get(ticket=ticket)
         if not matches:
             return jsonify({"error": "position not found", "ticket": ticket}), 404
@@ -468,6 +602,67 @@ def demo_position_close():
             "sent": result is not None and result.retcode == mt5.TRADE_RETCODE_DONE,
             "result": payload,
         })
+    finally:
+        mt5.shutdown()
+
+
+@app.post("/position-protection")
+def position_protection():
+    unauthorized = require_bridge_secret()
+    if unauthorized:
+        return unauthorized
+
+    payload = request.get_json(silent=True) or {}
+    if payload.get("confirm") != "DEMO_ONLY":
+        return jsonify({"error": "confirm must equal DEMO_ONLY"}), 400
+
+    try:
+        ticket = int(payload["ticket"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "ticket must be an integer"}), 400
+
+    provided = [key for key in ("stopLoss", "takeProfit") if key in payload]
+    if not provided:
+        return jsonify({"error": "stopLoss or takeProfit is required"}), 400
+
+    levels = {}
+    for key in provided:
+        try:
+            value = float(payload[key])
+        except (TypeError, ValueError):
+            return jsonify({"error": f"{key} must be numeric"}), 400
+        if value < 0:
+            return jsonify({"error": f"{key} cannot be negative"}), 400
+        levels[key] = value
+
+    mt5 = load_mt5()
+    if mt5 is None or not initialize_mt5(mt5):
+        error = str(mt5.last_error()) if mt5 is not None else "MetaTrader5 package is unavailable"
+        return jsonify({"error": "MT5 initialization failed", "details": error}), 503
+
+    try:
+        account = mt5.account_info()
+        if account is None or account.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO:
+            return jsonify({"error": "Position protection updates are demo-account only"}), 403
+        matches = mt5.positions_get(ticket=ticket)
+        if not matches:
+            return jsonify({"error": "position not found", "ticket": ticket}), 404
+
+        position = matches[0]
+        request_data = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": position.ticket,
+            "symbol": position.symbol,
+            "sl": levels.get("stopLoss", float(position.sl or 0)),
+            "tp": levels.get("takeProfit", float(position.tp or 0)),
+        }
+        result = mt5.order_send(request_data)
+        success = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
+        return jsonify({
+            "sent": success,
+            "request": request_data,
+            "result": result._asdict() if result else None,
+        }), 200 if success else 422
     finally:
         mt5.shutdown()
 
