@@ -308,7 +308,9 @@ def candles(symbol):
                 return jsonify({"error": "Second timeframe must be between 1s and 59s"}), 400
             if not mt5.symbol_select(symbol, True):
                 return jsonify({"error": "Unsupported symbol", "symbol": symbol}), 400
-            tick_count = min(max(count * 20, 1000), 50000)
+            tick_count = min(
+                max(count * max(1, timeframe_seconds), 1000), 50000
+            )
             start_time = datetime.now(timezone.utc) - timedelta(
                 seconds=timeframe_seconds * count * 3
             )
