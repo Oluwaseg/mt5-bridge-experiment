@@ -1,18 +1,37 @@
 import importlib.util
+import hmac
 import os
 import re
+import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from flask import Flask, jsonify, request
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 app = Flask(__name__)
+_mt5_request_lock = threading.RLock()
+
+
+@app.before_request
+def lock_mt5_request():
+    if request.endpoint != "health":
+        _mt5_request_lock.acquire()
+
+
+@app.teardown_request
+def unlock_mt5_request(_error):
+    if request.endpoint != "health":
+        _mt5_request_lock.release()
 
 
 def require_bridge_secret():
     expected = os.getenv("MT5_AGENT_SECRET", "").strip()
-    if expected and request.headers.get("X-MT5-Bridge-Secret") != expected:
+    if not expected:
+        return jsonify({"error": "MT5 bridge secret is not configured"}), 503
+    supplied = request.headers.get("X-MT5-Bridge-Secret", "")
+    if not hmac.compare_digest(supplied, expected):
         return jsonify({"error": "Invalid MT5 bridge secret"}), 401
     return None
 
@@ -29,27 +48,63 @@ def terminal_path():
     return value or None
 
 
-def initialize_mt5(mt5):
-    configured = {
-        "login": os.getenv("MT5_LOGIN", "").strip(),
-        "password": os.getenv("MT5_PASSWORD", "").strip(),
-        "server": os.getenv("MT5_SERVER", "").strip(),
+def request_account_config():
+    return {
+        "accountId": request.headers.get("X-MT5-Account-Id", "").strip(),
+        "login": request.headers.get("X-MT5-Login", "").strip(),
+        "password": request.headers.get("X-MT5-Password", ""),
+        "server": request.headers.get("X-MT5-Server", "").strip(),
     }
-    configured_values = [bool(value) for value in configured.values()]
-    if any(configured_values) and not all(configured_values):
+
+
+def initialize_mt5(mt5, account_config=None):
+    configured = account_config or request_account_config()
+    path = terminal_path()
+    if not all(
+        str(configured.get(field, ""))
+        for field in ("accountId", "login", "password", "server")
+    ) or not path:
+        return False
+    login = str(configured["login"]).strip()
+    if not login.isdigit() or not os.path.isfile(path):
         return False
 
-    initialize_kwargs = {}
-    path = terminal_path()
-    if path:
-        initialize_kwargs["path"] = path
-    if all(configured_values):
-        initialize_kwargs.update(
-            login=int(configured["login"]),
-            password=configured["password"],
-            server=configured["server"],
-        )
+    initialize_kwargs = {
+        "path": path,
+        "login": int(login),
+        "password": configured["password"],
+        "server": str(configured["server"]).strip(),
+    }
     return mt5.initialize(**initialize_kwargs)
+
+
+def initialization_failure_details(mt5, account_config=None):
+    configured = account_config or request_account_config()
+    missing = [
+        name
+        for name, value in (
+            ("X-MT5-Account-Id", str(configured.get("accountId", "")).strip()),
+            ("X-MT5-Login", str(configured.get("login", "")).strip()),
+            ("X-MT5-Password", configured.get("password", "")),
+            ("X-MT5-Server", str(configured.get("server", "")).strip()),
+            ("MT5_TERMINAL_PATH", terminal_path()),
+        )
+        if not value
+    ]
+    if missing:
+        return "Required MT5 settings are missing: " + ", ".join(missing)
+
+    login = str(configured.get("login", "")).strip()
+    if not login.isdigit():
+        return "X-MT5-Login must contain only digits"
+    if not os.path.isfile(terminal_path()):
+        return "MT5_TERMINAL_PATH does not point to an existing terminal executable"
+
+    try:
+        error_code, error_message = mt5.last_error()
+        return f"MetaTrader5.initialize failed (code={error_code}): {error_message}"
+    except Exception:
+        return "MetaTrader5.initialize failed; mt5.last_error() was unavailable"
 
 
 def protection_price(info, entry_price, side, volume, amount, is_take_profit):
@@ -354,7 +409,7 @@ def health():
                     "path": terminal_info.path if terminal_info else None,
                 }
             else:
-                initialize_error = str(mt5.last_error())
+                initialize_error = initialization_failure_details(mt5)
         except Exception as error:
             initialize_error = str(error)
         finally:
@@ -395,7 +450,11 @@ def account():
 
     mt5 = load_mt5()
     if mt5 is None or not initialize_mt5(mt5):
-        error = str(mt5.last_error()) if mt5 is not None else "MetaTrader5 package is unavailable"
+        error = (
+            initialization_failure_details(mt5)
+            if mt5 is not None
+            else "MetaTrader5 package is unavailable"
+        )
         return jsonify({"error": "MT5 initialization failed", "details": error}), 503
 
     try:
@@ -422,7 +481,11 @@ def positions():
 
     mt5 = load_mt5()
     if mt5 is None or not initialize_mt5(mt5):
-        error = str(mt5.last_error()) if mt5 is not None else "MetaTrader5 package is unavailable"
+        error = (
+            initialization_failure_details(mt5)
+            if mt5 is not None
+            else "MetaTrader5 package is unavailable"
+        )
         return jsonify({"error": "MT5 initialization failed", "details": error}), 503
 
     try:

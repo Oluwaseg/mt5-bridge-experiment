@@ -1,6 +1,10 @@
+import json
 import unittest
+from unittest.mock import patch
 
 from worker_identity import (
+    bridge_headers,
+    fetch_account_summary,
     validate_bound_account,
     classify_mt5_failure,
     normalize_order_response,
@@ -9,6 +13,9 @@ from worker_identity import (
     validate_demo_position_payload,
     validate_position_history_ticket,
     validate_symbol_order_specs,
+    validate_worker_account_config,
+    validate_bridge_url,
+    validate_worker_server_url,
 )
 
 
@@ -195,6 +202,177 @@ class BoundAccountPreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "disabled or close-only"):
             validate_symbol_order_specs(self.order, {**self.symbol_info, "trade_mode": 0})
 
+
+class WorkerAccountConfigurationTests(unittest.TestCase):
+    def test_validates_account_configuration_against_identity_ack(self):
+        identity_ack = {
+            "accountId": "account-a",
+            "accountConfig": {
+                "accountId": "account-a",
+                "login": "1048288",
+                "server": "Capital.comBah-Demo",
+                "password": "worker-memory-only-test",
+            },
+        }
+
+        config = validate_worker_account_config(identity_ack)
+
+        self.assertEqual(config["accountId"], "account-a")
+        self.assertEqual(config["login"], "1048288")
+        self.assertEqual(config["server"], "Capital.comBah-Demo")
+        self.assertEqual(config["password"], "worker-memory-only-test")
+
+    def test_rejects_mismatched_identity_or_missing_password(self):
+        with self.assertRaisesRegex(ValueError, "missing accountConfig"):
+            validate_worker_account_config({"accountId": "account-a"})
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            validate_worker_account_config(
+                {
+                    "accountId": "account-a",
+                    "accountConfig": {
+                        "accountId": "account-b",
+                        "login": "1048288",
+                        "server": "Capital.comBah-Demo",
+                        "password": "secret",
+                    },
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "password is missing"):
+            validate_worker_account_config(
+                {
+                    "accountId": "account-a",
+                    "accountConfig": {
+                        "accountId": "account-a",
+                        "login": "1048288",
+                        "server": "Capital.comBah-Demo",
+                        "password": "",
+                    },
+                }
+            )
+
+    def test_bridge_headers_carry_only_the_selected_account_config(self):
+        account_a = {
+            "accountId": "account-a",
+            "login": "1048288",
+            "server": "Capital.comBah-Demo",
+            "password": "password-a",
+        }
+        account_b = {
+            "accountId": "account-b",
+            "login": "2000001",
+            "server": "OtherBroker-Demo",
+            "password": "password-b",
+        }
+        with patch.dict("os.environ", {"MT5_AGENT_SECRET": "bridge-test-secret"}):
+            headers_a = bridge_headers(account_a)
+            headers_b = bridge_headers(account_b)
+
+        self.assertEqual(headers_a["X-MT5-Account-Id"], "account-a")
+        self.assertEqual(headers_a["X-MT5-Login"], "1048288")
+        self.assertEqual(headers_a["X-MT5-Server"], "Capital.comBah-Demo")
+        self.assertEqual(headers_a["X-MT5-Password"], "password-a")
+        self.assertEqual(headers_b["X-MT5-Account-Id"], "account-b")
+        self.assertEqual(headers_b["X-MT5-Login"], "2000001")
+        self.assertEqual(headers_b["X-MT5-Server"], "OtherBroker-Demo")
+        self.assertEqual(headers_b["X-MT5-Password"], "password-b")
+
+    def test_identity_ack_config_is_forwarded_to_probe_per_account(self):
+        identity_acks = [
+            {
+                "accountId": "account-a",
+                "accountConfig": {
+                    "accountId": "account-a",
+                    "login": "1048288",
+                    "server": "Capital.comBah-Demo",
+                    "password": "password-a",
+                },
+            },
+            {
+                "accountId": "account-b",
+                "accountConfig": {
+                    "accountId": "account-b",
+                    "login": "2000001",
+                    "server": "OtherBroker-Demo",
+                    "password": "password-b",
+                },
+            },
+        ]
+        requests = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "account": {
+                            "login": 1048288,
+                            "server": "Capital.comBah-Demo",
+                        },
+                        "terminal": {"connected": True, "tradeAllowed": True},
+                    }
+                ).encode()
+
+        def fake_urlopen(request, timeout):
+            requests.append(request)
+            self.assertEqual(timeout, 10)
+            return FakeResponse()
+
+        with patch.dict(
+            "os.environ",
+            {
+                "MT5_AGENT_SECRET": "bridge-test-secret",
+                "MT5_BRIDGE_URL": "http://127.0.0.1:8000",
+            },
+        ), patch("worker_identity.urlopen", side_effect=fake_urlopen):
+            for identity_ack in identity_acks:
+                account_config = validate_worker_account_config(identity_ack)
+                fetch_account_summary(account_config)
+
+        forwarded = [
+            {
+                "accountId": request.get_header("X-mt5-account-id"),
+                "login": request.get_header("X-mt5-login"),
+                "password": request.get_header("X-mt5-password"),
+                "server": request.get_header("X-mt5-server"),
+            }
+            for request in requests
+        ]
+        self.assertEqual(
+            forwarded,
+            [
+                {
+                    "accountId": "account-a",
+                    "login": "1048288",
+                    "password": "password-a",
+                    "server": "Capital.comBah-Demo",
+                },
+                {
+                    "accountId": "account-b",
+                    "login": "2000001",
+                    "password": "password-b",
+                    "server": "OtherBroker-Demo",
+                },
+            ],
+        )
+
+    def test_remote_credentials_require_encrypted_transport(self):
+        self.assertEqual(
+            validate_worker_server_url("ws://127.0.0.1:4000/api/worker-connect"),
+            "ws://127.0.0.1:4000/api/worker-connect",
+        )
+        self.assertEqual(
+            validate_bridge_url("http://localhost:8000"),
+            "http://localhost:8000",
+        )
+        with self.assertRaisesRegex(ValueError, "WSS"):
+            validate_worker_server_url("ws://backend.example/api/worker-connect")
+        with self.assertRaisesRegex(ValueError, "HTTPS"):
+            validate_bridge_url("http://bridge.example")
 
 class DemoPositionPayloadTests(unittest.TestCase):
     def test_validates_demo_close_ticket(self):

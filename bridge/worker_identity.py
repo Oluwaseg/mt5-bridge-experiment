@@ -1,13 +1,14 @@
 import asyncio
 from contextlib import suppress
 from decimal import Decimal, InvalidOperation
+import ipaddress
 import json
 import math
 import os
 from pathlib import Path
 import re
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
@@ -86,6 +87,83 @@ def validate_bound_account(
     if account.get("trade_mode") != 0:
         raise ValueError("MT5 account is not in demo trade mode")
     return account
+
+
+def validate_worker_account_config(identity_ack):
+    account_config = identity_ack.get("accountConfig")
+    expected_account_id = str(identity_ack.get("accountId", ""))
+    if not expected_account_id:
+        raise ValueError("Worker identity acknowledgment is missing account ID")
+    if not isinstance(account_config, dict):
+        raise ValueError("Backend identity acknowledgment is missing accountConfig")
+    configured_account_id = str(account_config.get("accountId", ""))
+    if not configured_account_id:
+        raise ValueError("Backend accountConfig is missing accountId")
+    if configured_account_id != expected_account_id:
+        raise ValueError(
+            "Backend accountConfig accountId does not match identity accountId"
+        )
+    if not str(account_config.get("login", "")).strip():
+        raise ValueError("Worker account login is missing")
+    if not str(account_config.get("server", "")).strip():
+        raise ValueError("Worker account server is missing")
+    if not isinstance(account_config.get("password"), str) or not account_config["password"]:
+        raise ValueError("Worker account password is missing")
+    return {
+        "accountId": expected_account_id,
+        "login": str(account_config["login"]).strip(),
+        "server": str(account_config["server"]).strip(),
+        "password": account_config["password"],
+    }
+
+
+def validate_worker_server_url(server_url):
+    parsed = urlsplit(server_url)
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Worker identity server URL is invalid")
+    if parsed.scheme == "wss":
+        return server_url
+    try:
+        loopback = ipaddress.ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        loopback = parsed.hostname.casefold() == "localhost"
+    if parsed.scheme != "ws" or not loopback:
+        raise ValueError("Worker identity server must use WSS unless it is local")
+    return server_url
+
+
+def validate_bridge_url(bridge_url):
+    parsed = urlsplit(bridge_url)
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("MT5 bridge URL is invalid")
+    if parsed.scheme == "https":
+        return bridge_url
+    try:
+        loopback = ipaddress.ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        loopback = parsed.hostname.casefold() == "localhost"
+    if parsed.scheme != "http" or not loopback:
+        raise ValueError("MT5 bridge must use HTTPS unless it is local")
+    return bridge_url
+
+
+def bridge_headers(account_config, content_type=None):
+    if not isinstance(account_config, dict):
+        raise ValueError("Worker account configuration is unavailable")
+    bridge_secret = os.getenv("MT5_AGENT_SECRET", "").strip()
+    if not bridge_secret:
+        raise RuntimeError("MT5_AGENT_SECRET is required for the local bridge")
+    validate_bridge_url(os.getenv("MT5_BRIDGE_URL", "http://127.0.0.1:8000"))
+    headers = {
+        "X-MT5-Bridge-Secret": bridge_secret,
+        "X-MT5-Account-Id": str(account_config["accountId"]),
+        "X-MT5-Login": str(account_config["login"]),
+        "X-MT5-Password": account_config["password"],
+        "X-MT5-Server": str(account_config["server"]),
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
 
 
 def validate_symbol_order_specs(order, symbol_info):
@@ -257,12 +335,11 @@ def pre_submission_failure(message, request_id):
     }
 
 
-def fetch_symbol_market_data(symbol):
+def fetch_symbol_market_data(symbol, account_config):
     bridge_url = os.getenv("MT5_BRIDGE_URL", "http://127.0.0.1:8000")
-    bridge_secret = os.getenv("MT5_AGENT_SECRET", "")
     request = Request(
         f"{bridge_url.rstrip('/')}/market-data/{symbol}",
-        headers={"X-MT5-Bridge-Secret": bridge_secret},
+        headers=bridge_headers(account_config),
     )
     try:
         with urlopen(request, timeout=10) as response:
@@ -282,17 +359,13 @@ def fetch_symbol_market_data(symbol):
     return payload
 
 
-def submit_demo_order(payload):
+def submit_demo_order(payload, account_config):
     bridge_url = os.getenv("MT5_BRIDGE_URL", "http://127.0.0.1:8000")
-    bridge_secret = os.getenv("MT5_AGENT_SECRET", "")
     validated = validate_demo_order_payload(payload)
     request = Request(
         f"{bridge_url.rstrip('/')}/demo-order-send",
         data=json.dumps({**validated, "confirm": "DEMO_ONLY"}).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "X-MT5-Bridge-Secret": bridge_secret,
-        },
+        headers=bridge_headers(account_config, "application/json"),
         method="POST",
     )
 
@@ -322,12 +395,11 @@ async def send_heartbeats(connection):
         )
 
 
-def fetch_account_summary():
+def fetch_account_summary(account_config):
     bridge_url = os.getenv("MT5_BRIDGE_URL", "http://127.0.0.1:8000")
-    bridge_secret = os.getenv("MT5_AGENT_SECRET", "")
     request = Request(
         f"{bridge_url.rstrip('/')}/account",
-        headers={"X-MT5-Bridge-Secret": bridge_secret},
+        headers=bridge_headers(account_config),
     )
 
     try:
@@ -362,19 +434,18 @@ def fetch_account_summary():
     }
 
 
-def fetch_positions_summary(expected_login, expected_server):
-    account_health = fetch_account_summary()
+def fetch_positions_summary(account_config):
+    account_health = fetch_account_summary(account_config)
     validate_bound_account(
         account_health,
-        expected_login,
-        expected_server,
+        account_config["login"],
+        account_config["server"],
         require_trade_allowed=False,
     )
     bridge_url = os.getenv("MT5_BRIDGE_URL", "http://127.0.0.1:8000")
-    bridge_secret = os.getenv("MT5_AGENT_SECRET", "")
     request = Request(
         f"{bridge_url.rstrip('/')}/positions",
-        headers={"X-MT5-Bridge-Secret": bridge_secret},
+        headers=bridge_headers(account_config),
     )
 
     try:
@@ -403,13 +474,12 @@ def fetch_positions_summary(expected_login, expected_server):
     ]
 
 
-def fetch_candles(symbol, timeframe, count):
+def fetch_candles(symbol, timeframe, count, account_config):
     bridge_url = os.getenv("MT5_BRIDGE_URL", "http://127.0.0.1:8000")
-    bridge_secret = os.getenv("MT5_AGENT_SECRET", "")
     query = urlencode({"timeframe": timeframe, "count": int(count)})
     request = Request(
         f"{bridge_url.rstrip('/')}/candles/{quote(symbol, safe='')}?{query}",
-        headers={"X-MT5-Bridge-Secret": bridge_secret},
+        headers=bridge_headers(account_config),
     )
     try:
         with urlopen(request, timeout=10) as response:
@@ -427,21 +497,20 @@ def fetch_candles(symbol, timeframe, count):
         raise RuntimeError("MT5 probe is unreachable") from error
 
 
-def fetch_position_history(ticket, expected_login, expected_server):
+def fetch_position_history(ticket, account_config):
     position_ticket = validate_position_history_ticket(ticket)
 
-    account_health = fetch_account_summary()
+    account_health = fetch_account_summary(account_config)
     validate_bound_account(
         account_health,
-        expected_login,
-        expected_server,
+        account_config["login"],
+        account_config["server"],
         require_trade_allowed=False,
     )
     bridge_url = os.getenv("MT5_BRIDGE_URL", "http://127.0.0.1:8000")
-    bridge_secret = os.getenv("MT5_AGENT_SECRET", "")
     request = Request(
         f"{bridge_url.rstrip('/')}/position-history/{position_ticket}",
-        headers={"X-MT5-Bridge-Secret": bridge_secret},
+        headers=bridge_headers(account_config),
     )
     try:
         with urlopen(request, timeout=10) as response:
@@ -459,21 +528,20 @@ def fetch_position_history(ticket, expected_login, expected_server):
         raise RuntimeError("MT5 probe is unreachable") from error
 
 
-def fetch_execution_status(client_order_id, expected_login, expected_server):
+def fetch_execution_status(client_order_id, account_config):
     if not re.fullmatch(r"mt5-[a-f0-9]{24}", str(client_order_id or "")):
         raise ValueError("clientOrderId is invalid")
-    account_health = fetch_account_summary()
+    account_health = fetch_account_summary(account_config)
     validate_bound_account(
         account_health,
-        expected_login,
-        expected_server,
+        account_config["login"],
+        account_config["server"],
         require_trade_allowed=False,
     )
     bridge_url = os.getenv("MT5_BRIDGE_URL", "http://127.0.0.1:8000")
-    bridge_secret = os.getenv("MT5_AGENT_SECRET", "")
     request = Request(
         f"{bridge_url.rstrip('/')}/execution-status/{client_order_id}",
-        headers={"X-MT5-Bridge-Secret": bridge_secret},
+        headers=bridge_headers(account_config),
     )
     try:
         with urlopen(request, timeout=10) as response:
@@ -491,16 +559,17 @@ def fetch_execution_status(client_order_id, expected_login, expected_server):
         raise RuntimeError("MT5 probe is unreachable") from error
 
 
-def close_demo_position(payload, expected_login, expected_server):
+def close_demo_position(payload, account_config):
     validated = validate_demo_position_payload(payload)
-    account_health = fetch_account_summary()
-    validate_bound_account(account_health, expected_login, expected_server)
+    account_health = fetch_account_summary(account_config)
+    validate_bound_account(
+        account_health, account_config["login"], account_config["server"]
+    )
     bridge_url = os.getenv("MT5_BRIDGE_URL", "http://127.0.0.1:8000")
-    bridge_secret = os.getenv("MT5_AGENT_SECRET", "")
     request = Request(
         f"{bridge_url.rstrip('/')}/demo-position-close",
         data=json.dumps(validated).encode("utf-8"),
-        headers={"Content-Type": "application/json", "X-MT5-Bridge-Secret": bridge_secret},
+        headers=bridge_headers(account_config, "application/json"),
         method="POST",
     )
     try:
@@ -517,16 +586,17 @@ def close_demo_position(payload, expected_login, expected_server):
         raise RuntimeError("MT5 probe is unreachable") from error
 
 
-def update_demo_position_protection(payload, expected_login, expected_server):
+def update_demo_position_protection(payload, account_config):
     validated = validate_demo_position_payload(payload, protection=True)
-    account_health = fetch_account_summary()
-    validate_bound_account(account_health, expected_login, expected_server)
+    account_health = fetch_account_summary(account_config)
+    validate_bound_account(
+        account_health, account_config["login"], account_config["server"]
+    )
     bridge_url = os.getenv("MT5_BRIDGE_URL", "http://127.0.0.1:8000")
-    bridge_secret = os.getenv("MT5_AGENT_SECRET", "")
     request = Request(
         f"{bridge_url.rstrip('/')}/position-protection",
         data=json.dumps(validated).encode("utf-8"),
-        headers={"Content-Type": "application/json", "X-MT5-Bridge-Secret": bridge_secret},
+        headers=bridge_headers(account_config, "application/json"),
         method="POST",
     )
     try:
@@ -556,13 +626,14 @@ async def run_connection(
         if response.get("type") != "identity_ack":
             raise RuntimeError("Server did not acknowledge worker identity")
 
+        account_config = validate_worker_account_config(response)
         print(
             "Identity accepted: "
             f"worker={response['workerId']} user={response['userId']} "
             f"account={response['accountId']}"
         )
-        expected_login = response.get("login", expected_login)
-        expected_server = response.get("server", expected_server)
+        expected_login = account_config["login"]
+        expected_server = account_config["server"]
         print("Waiting for server ping. Press Ctrl+C to stop.")
         heartbeat_task = asyncio.create_task(send_heartbeats(connection))
         try:
@@ -593,20 +664,22 @@ async def run_connection(
                             command.get("payload") or {}
                         )
                         account_health = await asyncio.to_thread(
-                            fetch_account_summary
+                            fetch_account_summary, account_config
                         )
                         validate_bound_account(
                             account_health, expected_login, expected_server
                         )
                         market_data = await asyncio.to_thread(
-                            fetch_symbol_market_data, order_payload["symbol"]
+                            fetch_symbol_market_data,
+                            order_payload["symbol"],
+                            account_config,
                         )
                         validate_symbol_order_specs(
                             order_payload, market_data.get("info")
                         )
                         submission_started = True
                         response = await asyncio.to_thread(
-                            submit_demo_order, order_payload
+                            submit_demo_order, order_payload, account_config
                         )
                         result = normalize_order_response(
                             response, command.get("requestId")
@@ -644,8 +717,7 @@ async def run_connection(
                         status = await asyncio.to_thread(
                             fetch_execution_status,
                             (command.get("payload") or {}).get("clientOrderId"),
-                            expected_login,
-                            expected_server,
+                            account_config,
                         )
                         result = {
                             "type": "result",
@@ -671,6 +743,7 @@ async def run_connection(
                             str(payload.get("symbol", "")).upper(),
                             str(payload.get("timeframe", "1m")),
                             int(payload.get("count", 300)),
+                            account_config,
                         )
                         result = {
                             "type": "result",
@@ -688,8 +761,7 @@ async def run_connection(
                         response = await asyncio.to_thread(
                             close_demo_position,
                             command.get("payload") or {},
-                            expected_login,
-                            expected_server,
+                            account_config,
                         )
                         result = {"type": "result", "requestId": command.get("requestId"), "ok": bool(response.get("sent")), "close": response}
                     except (RuntimeError, ValueError) as error:
@@ -702,8 +774,7 @@ async def run_connection(
                         response = await asyncio.to_thread(
                             update_demo_position_protection,
                             command.get("payload") or {},
-                            expected_login,
-                            expected_server,
+                            account_config,
                         )
                         result = {"type": "result", "requestId": command.get("requestId"), "ok": bool(response.get("sent")), "protection": response}
                     except (RuntimeError, ValueError) as error:
@@ -715,8 +786,7 @@ async def run_connection(
                     try:
                         positions = await asyncio.to_thread(
                             fetch_positions_summary,
-                            expected_login,
-                            expected_server,
+                            account_config,
                         )
                         result = {
                             "type": "result",
@@ -747,8 +817,7 @@ async def run_connection(
                         history = await asyncio.to_thread(
                             fetch_position_history,
                             (command.get("payload") or {}).get("ticket"),
-                            expected_login,
-                            expected_server,
+                            account_config,
                         )
                         result = {
                             "type": "result",
@@ -770,7 +839,15 @@ async def run_connection(
                     raise RuntimeError("Server requested an unsupported command")
 
                 try:
-                    health = await asyncio.to_thread(fetch_account_summary)
+                    health = await asyncio.to_thread(
+                        fetch_account_summary, account_config
+                    )
+                    validate_bound_account(
+                        health,
+                        expected_login,
+                        expected_server,
+                        require_trade_allowed=False,
+                    )
                     result = {
                         "type": "result",
                         "requestId": command.get("requestId"),
@@ -804,6 +881,7 @@ async def run_worker():
         "WORKER_IDENTITY_SERVER_URL",
         "ws://127.0.0.1:4000/api/worker-connect",
     )
+    validate_worker_server_url(server_url)
     worker_id = os.getenv("WORKER_ID", "local-dev-worker")
     token = os.getenv("WORKER_IDENTITY_TOKEN", "")
     if not token:
@@ -828,6 +906,8 @@ async def run_worker():
             )
             if forced_disconnect:
                 test_disconnect_done = True
+        except ValueError as error:
+            print(f"Worker connection ended (ValueError: {error}); retrying.")
         except Exception as error:
             print(f"Worker connection ended ({type(error).__name__}); retrying.")
 

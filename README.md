@@ -39,12 +39,8 @@ Then populate the local `.env` file with placeholders only:
 ```ini
 PORT=8000
 MT5_TERMINAL_PATH=C:\\path\\to\\terminal\\terminal.exe
-MT5_LOGIN=
-MT5_PASSWORD=
-MT5_SERVER=
 MT5_AGENT_SECRET=
 MT5_BRIDGE_URL=http://127.0.0.1:8000
-REMOTE_WORKER_ENABLED=true
 WORKER_IDENTITY_SERVER_URL=ws://127.0.0.1:4000/api/worker-connect
 WORKER_ID=windows-demo-worker
 WORKER_IDENTITY_TOKEN=
@@ -53,14 +49,15 @@ WORKER_RECONNECT_DELAY_SECONDS=2
 
 Do not commit any real `.env` file or credentials. Keep them local only.
 
+The sample `ws://` and `http://` URLs are for loopback development only. Use `wss://` for a remote backend and `https://` for a remote bridge because the authenticated connection carries the selected account password in memory.
+
 ## MT5 terminal and broker setup
 
-1. Install the MT5 terminal and log in to the correct demo account manually.
-2. Confirm the login and server match the account you want the worker to bind to.
-3. Set `MT5_TERMINAL_PATH` to the installed terminal executable if the bridge must launch or verify it.
-4. If you are using a specific demo account instead of the already logged-in terminal account, fill in `MT5_LOGIN`, `MT5_PASSWORD`, and `MT5_SERVER` in `.env`.
+1. Install the MT5 terminal and set `MT5_TERMINAL_PATH` to its executable.
+2. The selected customer account login, server, and password come from the backend's encrypted MT5 account record after worker-token authentication. Do not put customer-specific account fields in this `.env`.
+3. The backend sends that account config over the authenticated worker WebSocket. The worker holds it in memory and forwards it on each loopback bridge request; the probe uses it only for that request and does not persist it.
 
-The worker must not be started with a real broker secret or trading token in Git; secure provisioning is done by the backend through the MT5 account token flow.
+The shared bridge secret and worker identity token remain local secrets and must not be committed.
 
 ## Backend configuration and pairing
 
@@ -94,6 +91,8 @@ Equivalent module start:
 .\.venv\Scripts\Activate.ps1
 python -m bridge.worker_identity
 ```
+
+./.venv/Scripts/python.exe ./bridge/probe.py
 
 This is the authenticated remote MT5 worker. It listens to the backend worker identity socket and reconnects automatically on loss of connection.
 

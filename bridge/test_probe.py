@@ -1,4 +1,5 @@
 import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -6,11 +7,114 @@ from unittest.mock import patch
 from bridge.probe import (
     aggregate_mt5_ticks,
     classify_execution_history,
+    initialize_mt5,
+    initialization_failure_details,
     protection_price,
     position_ticket_from_deal_history,
     summarize_position_history,
     app,
 )
+
+
+class Mt5InitializationTests(unittest.TestCase):
+    def test_initialization_uses_configured_terminal_login_and_server(self):
+        with tempfile.NamedTemporaryFile() as terminal:
+            captured = {}
+            mt5 = SimpleNamespace(
+                initialize=lambda **kwargs: captured.update(kwargs) or True
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "MT5_TERMINAL_PATH": terminal.name,
+                },
+            ):
+                self.assertTrue(
+                    initialize_mt5(
+                        mt5,
+                        {
+                            "accountId": "account-a",
+                            "login": "1048288",
+                            "password": "saved-password",
+                            "server": "Capital.comBah-Demo",
+                        },
+                    )
+                )
+
+        self.assertEqual(captured["path"], terminal.name)
+        self.assertEqual(captured["login"], 1048288)
+        self.assertEqual(captured["server"], "Capital.comBah-Demo")
+        self.assertEqual(captured["password"], "saved-password")
+
+    def test_configured_password_is_passed_only_to_initialize(self):
+        with tempfile.NamedTemporaryFile() as terminal:
+            captured = {}
+            mt5 = SimpleNamespace(
+                initialize=lambda **kwargs: captured.update(kwargs) or True
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "MT5_TERMINAL_PATH": terminal.name,
+                },
+            ):
+                self.assertTrue(
+                    initialize_mt5(
+                        mt5,
+                        {
+                            "accountId": "account-a",
+                            "login": "1048288",
+                            "password": "local-test-secret",
+                            "server": "Capital.comBah-Demo",
+                        },
+                    )
+                )
+
+        self.assertEqual(captured["password"], "local-test-secret")
+
+    def test_missing_identity_config_fails_without_default_terminal_fallback(self):
+        mt5 = SimpleNamespace(initialize=lambda **_kwargs: self.fail("must not initialize"))
+        with patch.dict(
+            os.environ,
+            {"MT5_TERMINAL_PATH": ""},
+        ):
+            empty_account = {
+                "accountId": "",
+                "login": "",
+                "password": "",
+                "server": "",
+            }
+            self.assertFalse(initialize_mt5(mt5, empty_account))
+            details = initialization_failure_details(mt5, empty_account)
+
+        self.assertIn("X-MT5-Login", details)
+        self.assertIn("X-MT5-Server", details)
+        self.assertIn("MT5_TERMINAL_PATH", details)
+
+    def test_initialize_failure_reports_mt5_error_without_credentials(self):
+        with tempfile.NamedTemporaryFile() as terminal:
+            mt5 = SimpleNamespace(
+                initialize=lambda **_kwargs: False,
+                last_error=lambda: (10004, "No connection"),
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "MT5_TERMINAL_PATH": terminal.name,
+                },
+            ):
+                account_config = {
+                    "accountId": "account-a",
+                    "login": "1048288",
+                    "password": "do-not-report-this",
+                    "server": "Capital.comBah-Demo",
+                }
+                self.assertFalse(initialize_mt5(mt5, account_config))
+                details = initialization_failure_details(mt5, account_config)
+
+        self.assertIn("code=10004", details)
+        self.assertIn("No connection", details)
+        self.assertNotIn("do-not-report-this", details)
 
 
 class ProtectionPriceTests(unittest.TestCase):
@@ -198,6 +302,86 @@ class PositionHistoryEndpointTests(unittest.TestCase):
         self.assertAlmostEqual(response.json["profit"], 2.9)
         self.assertEqual(position_queries, [{"ticket": 88}])
         self.assertEqual(history_queries, [{"position": 88}])
+
+
+class AccountScopedProbeEndpointTests(unittest.TestCase):
+    def test_account_endpoint_initializes_each_request_with_its_worker_config(self):
+        with tempfile.NamedTemporaryFile() as terminal:
+            calls = []
+            active = {}
+
+            class FakeMt5:
+                def initialize(self, **kwargs):
+                    calls.append(dict(kwargs))
+                    active.update(kwargs)
+                    return True
+
+                def account_info(self):
+                    return SimpleNamespace(
+                        login=active["login"],
+                        server=active["server"],
+                        trade_mode=0,
+                        _asdict=lambda: {
+                            "login": active["login"],
+                            "server": active["server"],
+                            "trade_mode": 0,
+                        },
+                    )
+
+                def terminal_info(self):
+                    return SimpleNamespace(connected=True, trade_allowed=True)
+
+                def shutdown(self):
+                    return None
+
+            client = app.test_client()
+            account_configs = [
+                {
+                    "accountId": "account-a",
+                    "login": "1048288",
+                    "password": "password-a",
+                    "server": "Capital.comBah-Demo",
+                },
+                {
+                    "accountId": "account-b",
+                    "login": "2000001",
+                    "password": "password-b",
+                    "server": "OtherBroker-Demo",
+                },
+            ]
+
+            with patch.dict(
+                os.environ,
+                {
+                    "MT5_TERMINAL_PATH": terminal.name,
+                    "MT5_AGENT_SECRET": "bridge-test-secret",
+                },
+                clear=False,
+            ), patch("bridge.probe.load_mt5", return_value=FakeMt5()):
+                responses = []
+                for config in account_configs:
+                    responses.append(
+                        client.get(
+                            "/account",
+                            headers={
+                                "X-MT5-Bridge-Secret": "bridge-test-secret",
+                                "X-MT5-Account-Id": config["accountId"],
+                                "X-MT5-Login": config["login"],
+                                "X-MT5-Password": config["password"],
+                                "X-MT5-Server": config["server"],
+                            },
+                        )
+                    )
+
+        self.assertEqual([response.status_code for response in responses], [200, 200])
+        self.assertEqual(
+            [(call["login"], call["server"]) for call in calls],
+            [
+                (1048288, "Capital.comBah-Demo"),
+                (2000001, "OtherBroker-Demo"),
+            ],
+        )
+        self.assertEqual([call["password"] for call in calls], ["password-a", "password-b"])
 
 
 class ExecutionStatusTests(unittest.TestCase):
