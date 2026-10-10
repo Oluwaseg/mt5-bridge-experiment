@@ -134,6 +134,202 @@ def aggregate_mt5_ticks(ticks, timeframe_seconds, maximum_candles):
     return candles[-limit:]
 
 
+def summarize_position_history(
+    deals,
+    ticket,
+    is_open,
+    entry_in=0,
+    entry_out=1,
+    entry_inout=2,
+    entry_out_by=3,
+    buy_type=0,
+):
+    matching = []
+    for deal in deals or ():
+        values = deal if isinstance(deal, dict) else deal._asdict()
+        position_id = values.get("position_id", values.get("position"))
+        if position_id is not None and int(position_id) != int(ticket):
+            continue
+        matching.append(values)
+
+    close_entries = {entry_out, entry_inout, entry_out_by}
+    closing = [deal for deal in matching if deal.get("entry") in close_entries]
+    opening = [deal for deal in matching if deal.get("entry") == entry_in]
+    closed = not is_open and bool(closing)
+
+    def finite_value(deal, field):
+        try:
+            value = float(deal.get(field, 0) or 0)
+            return value if value == value and abs(value) != float("inf") else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    close_volume = sum(finite_value(deal, "volume") for deal in closing)
+    close_price = (
+        sum(
+            finite_value(deal, "price") * finite_value(deal, "volume")
+            for deal in closing
+        )
+        / close_volume
+        if close_volume > 0
+        else None
+    )
+    open_volume = sum(finite_value(deal, "volume") for deal in opening)
+    buy_price = (
+        sum(
+            finite_value(deal, "price") * finite_value(deal, "volume")
+            for deal in opening
+        )
+        / open_volume
+        if open_volume > 0
+        else None
+    )
+    last_close = max(
+        closing,
+        key=lambda deal: deal.get("time_msc", deal.get("time", 0)),
+        default={},
+    )
+    direction = None
+    if opening:
+        direction = "BUY" if opening[0].get("type") == buy_type else "SELL"
+
+    realized_profit = None
+    if closed:
+        realized_profit = sum(
+            finite_value(deal, field)
+            for deal in matching
+            for field in ("profit", "commission", "swap", "fee")
+        )
+
+    return {
+        "ticket": int(ticket),
+        "is_open": bool(is_open),
+        "closed": closed,
+        "buy_price": buy_price,
+        "close_price": close_price,
+        "profit": realized_profit,
+        "direction": direction,
+        "size": close_volume or open_volume or None,
+        "close_time": last_close.get("time", last_close.get("time_msc")),
+        "close_reason": last_close.get("reason"),
+        "deal_count": len(matching),
+    }
+
+
+def position_ticket_from_deal_history(mt5, result):
+    deal_ticket = getattr(result, "deal", None)
+    if not deal_ticket:
+        return None
+    try:
+        deals = mt5.history_deals_get(ticket=int(deal_ticket)) or ()
+    except (TypeError, ValueError):
+        return None
+    for deal in deals:
+        values = deal if isinstance(deal, dict) else deal._asdict()
+        position_id = values.get("position_id", values.get("position"))
+        if position_id:
+            return int(position_id)
+    return None
+
+
+def classify_execution_history(client_order_id, positions, orders, deals, mt5):
+    def as_values(item):
+        if isinstance(item, dict):
+            return item
+        if hasattr(item, "_asdict"):
+            return item._asdict()
+        return vars(item)
+
+    matching_positions = [
+        position
+        for position in positions or ()
+        if str(position.comment).strip() == client_order_id
+    ]
+    matching_orders = [
+        order
+        for order in orders or ()
+        if str(order.comment).strip() == client_order_id
+    ]
+    matching_deals = [
+        deal
+        for deal in deals or ()
+        if str(deal.comment).strip() == client_order_id
+    ]
+
+    if matching_positions:
+        position = as_values(matching_positions[0])
+        return {
+            "status": "OPEN",
+            "clientOrderId": client_order_id,
+            "ticket": position.get("ticket"),
+            "position": {
+                key: position.get(key)
+                for key in (
+                    "ticket", "symbol", "type", "volume", "price_open",
+                    "price_current", "profit", "sl", "tp", "time",
+                )
+            },
+        }
+
+    if matching_deals:
+        position_ids = {
+            int(deal.position_id)
+            for deal in matching_deals
+            if getattr(deal, "position_id", None)
+        }
+        for position_id in position_ids:
+            live_position = next(
+                (
+                    position
+                    for position in positions or ()
+                    if int(getattr(position, "ticket", 0)) == position_id
+                ),
+                None,
+            )
+            if live_position is not None:
+                live_values = live_position._asdict()
+                return {
+                    "status": "OPEN",
+                    "clientOrderId": client_order_id,
+                    "ticket": position_id,
+                    "position": live_values,
+                }
+            position_deals = mt5.history_deals_get(position=position_id) or ()
+            summary = summarize_position_history(
+                position_deals,
+                position_id,
+                False,
+                entry_in=mt5.DEAL_ENTRY_IN,
+                entry_out=mt5.DEAL_ENTRY_OUT,
+                entry_inout=mt5.DEAL_ENTRY_INOUT,
+                entry_out_by=mt5.DEAL_ENTRY_OUT_BY,
+                buy_type=mt5.DEAL_TYPE_BUY,
+            )
+            if summary["closed"]:
+                return {
+                    "status": "CLOSED",
+                    "clientOrderId": client_order_id,
+                    **summary,
+                }
+
+    rejected_states = {
+        getattr(mt5, "ORDER_STATE_REJECTED", object()),
+        getattr(mt5, "ORDER_STATE_CANCELED", object()),
+        getattr(mt5, "ORDER_STATE_EXPIRED", object()),
+    }
+    if matching_orders and not matching_deals and all(
+        order.state in rejected_states for order in matching_orders
+    ):
+        order = as_values(matching_orders[-1])
+        return {
+            "status": "FAILED",
+            "clientOrderId": client_order_id,
+            "order": order,
+        }
+
+    return {"status": "UNKNOWN", "clientOrderId": client_order_id}
+
+
 @app.get("/health")
 def health():
     mt5_path = terminal_path()
@@ -236,6 +432,63 @@ def positions():
             "symbol": symbol,
             "positions": [position._asdict() for position in (open_positions or ())],
         })
+    finally:
+        mt5.shutdown()
+
+
+@app.get("/position-history/<int:ticket>")
+def position_history(ticket):
+    unauthorized = require_bridge_secret()
+    if unauthorized:
+        return unauthorized
+
+    mt5 = load_mt5()
+    if mt5 is None or not initialize_mt5(mt5):
+        error = str(mt5.last_error()) if mt5 is not None else "MetaTrader5 package is unavailable"
+        return jsonify({"error": "MT5 initialization failed", "details": error}), 503
+
+    try:
+        matches = mt5.positions_get(ticket=ticket) or ()
+        deals = mt5.history_deals_get(position=ticket) or ()
+        summary = summarize_position_history(
+            deals,
+            ticket,
+            bool(matches),
+            entry_in=mt5.DEAL_ENTRY_IN,
+            entry_out=mt5.DEAL_ENTRY_OUT,
+            entry_inout=mt5.DEAL_ENTRY_INOUT,
+            entry_out_by=mt5.DEAL_ENTRY_OUT_BY,
+            buy_type=mt5.DEAL_TYPE_BUY,
+        )
+        return jsonify(summary)
+    finally:
+        mt5.shutdown()
+
+
+@app.get("/execution-status/<client_order_id>")
+def execution_status(client_order_id):
+    unauthorized = require_bridge_secret()
+    if unauthorized:
+        return unauthorized
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,31}", client_order_id):
+        return jsonify({"error": "invalid client order ID"}), 400
+
+    mt5 = load_mt5()
+    if mt5 is None or not initialize_mt5(mt5):
+        error = str(mt5.last_error()) if mt5 is not None else "MetaTrader5 package is unavailable"
+        return jsonify({"error": "MT5 initialization failed", "details": error}), 503
+
+    try:
+        now = datetime.now()
+        since = now - timedelta(days=7)
+        positions = mt5.positions_get() or ()
+        orders = mt5.history_orders_get(since, now) or ()
+        deals = mt5.history_deals_get(since, now) or ()
+        return jsonify(
+            classify_execution_history(
+                client_order_id, positions, orders, deals, mt5
+            )
+        )
     finally:
         mt5.shutdown()
 
@@ -477,7 +730,7 @@ def demo_order_send():
             "tp": take_profit_price,
             "deviation": 20,
             "magic": 26092401,
-            "comment": "phase-0-demo-order",
+            "comment": str(payload.get("comment") or "phase-0-demo-order")[:31],
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": filling_type,
         }
@@ -489,8 +742,13 @@ def demo_order_send():
             }), 422
 
         result = mt5.order_send(request_data)
+        sent = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
+        position_ticket = (
+            position_ticket_from_deal_history(mt5, result) if sent else None
+        )
         return jsonify({
-            "sent": result is not None and result.retcode == mt5.TRADE_RETCODE_DONE,
+            "sent": sent,
+            "position_ticket": position_ticket,
             "result": result._asdict() if result else None,
         })
     finally:
