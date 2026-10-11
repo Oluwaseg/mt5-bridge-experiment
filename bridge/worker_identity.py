@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -858,7 +859,7 @@ async def run_connection(
                         "Read-only account result returned; fields: "
                         + ", ".join(health["account"].keys())
                     )
-                except RuntimeError as error:
+                except (RuntimeError, ValueError) as error:
                     result = {
                         "type": "result",
                         "requestId": command.get("requestId"),
@@ -874,6 +875,16 @@ async def run_connection(
                 await heartbeat_task
 
     return False
+
+
+def terminal_worker_exit_code(close_reason):
+    return {
+        "Connector credential revoked": 20,
+        "Connector revoked": 20,
+        "Connector credential rotated": 21,
+        "Worker identity rejected": 22,
+        "Worker account configuration unavailable": 22,
+    }.get(close_reason)
 
 
 async def run_worker():
@@ -908,6 +919,32 @@ async def run_worker():
                 test_disconnect_done = True
         except ValueError as error:
             print(f"Worker connection ended (ValueError: {error}); retrying.")
+        except ConnectionClosed as error:
+            close_frame = error.rcvd or error.sent
+            close_code = close_frame.code if close_frame else 1006
+            close_reason = close_frame.reason if close_frame else ""
+            terminal_code = terminal_worker_exit_code(close_reason)
+            if terminal_code == 20:
+                print("Access revoked by Profit Pilot. Pair this connector again.")
+                return terminal_code
+            if terminal_code == 21:
+                print("Connector credential changed. Pair this connector again.")
+                return terminal_code
+            if terminal_code == 22:
+                print("Profit Pilot rejected this connector credential or account assignment.")
+                return terminal_code
+            safe_reasons = {
+                "Worker identity rejected",
+                "Worker account configuration unavailable",
+                "Worker already connected for this account",
+                "Connector credential revoked",
+                "Connector revoked",
+                "Connector credential rotated",
+            }
+            reason = close_reason if close_reason in safe_reasons else "connection closed"
+            print(
+                f"Worker connection ended (WebSocket {close_code}: {reason}); retrying."
+            )
         except Exception as error:
             print(f"Worker connection ended ({type(error).__name__}); retrying.")
 
@@ -917,6 +954,6 @@ async def run_worker():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(run_worker())
+        raise SystemExit(asyncio.run(run_worker()))
     except KeyboardInterrupt:
         pass

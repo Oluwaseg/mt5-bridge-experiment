@@ -1,6 +1,22 @@
-# MT5 remote worker demo setup
+# MT5 Connector and developer worker
 
-This folder contains the Windows-side MT5 bridge and authenticated remote-worker process used for a controlled remote demo test. It is not a general trading installer, and it does not add any new trading features.
+This folder contains the existing Windows-side MT5 bridge and authenticated remote worker, plus an early desktop connector prototype. It is not yet a signed installer or production customer release.
+
+## Desktop connector prototype
+
+The prototype UI starts with:
+
+```powershell
+py -3.11 .\connector_app.py
+```
+
+It accepts the temporary code from the authenticated website, exchanges it with `POST /api/mt5/connectors/exchange`, stores the returned device credential protected with the current Windows user's DPAPI, and starts the existing bridge and WebSocket worker. The local bridge is bound to loopback on an ephemeral port in connector mode. The worker still receives assigned account credentials from the backend and verifies the live MT5 account before the UI reports Connected.
+
+The source-run prototype requires the Windows MT5 Python dependency. It does not need a customer `.env` file or an account-specific environment value. `PROFIT_PILOT_API_URL` is an optional developer override; the production API origin is currently in `bridge/connector_core.py`.
+
+For the reproducible executable build procedure, see [WINDOWS_CONNECTOR_BUILD.md](WINDOWS_CONNECTOR_BUILD.md). PyInstaller output is currently unsigned and must not be represented as a released installer.
+
+The existing environment-based worker instructions below are retained for developer use; the customer connector does not use or replace that setup.
 
 ## What actually starts here
 

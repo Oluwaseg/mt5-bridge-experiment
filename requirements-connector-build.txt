@@ -1,0 +1,7 @@
+# Use a supported Windows Python runtime (currently test against Python 3.11 x64).
+-r requirements.txt
+-r requirements-mt5-windows.txt
+PyInstaller==6.11.1
+# NumPy 1.26.4's new C-extension submodule layout was not discovered reliably by
+# the pinned PyInstaller release; MT5 supports NumPy >=1.7, so pin a stable ABI.
+numpy==1.26.4

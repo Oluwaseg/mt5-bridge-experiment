@@ -1,0 +1,19 @@
+# Resolved on Windows x64 with CPython 3.11.9 for the successful connector build.
+# Rebuild/update this platform-specific lock only after validating a clean Windows build.
+altgraph==0.17.5
+blinker==1.9.0
+click==8.5.0
+Flask==3.1.0
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.4
+MetaTrader5==5.0.6180
+numpy==1.26.4
+packaging==26.3
+pefile==2023.2.7
+PyInstaller==6.11.1
+pyinstaller-hooks-contrib==2026.8
+python-dotenv==1.1.0
+pywin32-ctypes==0.2.3
+websockets==15.0.1
+Werkzeug==3.1.9
