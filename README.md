@@ -1,46 +1,28 @@
-# MT5 Connector and developer worker
+# MT5 Windows Bridge and Connector
 
-This folder contains the existing Windows-side MT5 bridge and authenticated remote worker, plus an early desktop connector prototype. It is not yet a signed installer or production customer release.
+This folder contains two ways to connect a Windows MT5 terminal to the Profit Pilot server: the packaged desktop connector (`.exe`) and a manual Python worker setup for development and diagnostics. Both authenticate a worker to one account and verify the terminal's login and server.
 
-## Desktop connector prototype
+> **Execution is demo-only.** The current MT5 worker and bridge reject live-account order execution. Orders are additionally restricted to approved test symbols and a maximum volume of `0.01`. A successful connector status is not authorization for live trading.
 
-The prototype UI starts with:
+## Packaged Windows connector
 
-```powershell
-py -3.11 .\connector_app.py
-```
+The current workspace build is `dist\ProfitPilotConnector.exe`. Run it on the Windows PC that has the MT5 terminal installed. The `.exe` starts its local bridge and worker itself; do not also start `probe.py` or `worker_identity.py` for the same connector session.
 
-It accepts the temporary code from the authenticated website, exchanges it with `POST /api/mt5/connectors/exchange`, stores the returned device credential protected with the current Windows user's DPAPI, and starts the existing bridge and WebSocket worker. The local bridge is bound to loopback on an ephemeral port in connector mode. The worker still receives assigned account credentials from the backend and verifies the live MT5 account before the UI reports Connected.
+1. In the Profit Pilot app, add the MT5 account and generate a pairing code for that account.
+2. Open `ProfitPilotConnector.exe`, choose the matching MT5 terminal executable, and enter the pairing code before it expires.
+3. Confirm the connector reports the expected account login and server.
 
-The source-run prototype requires the Windows MT5 Python dependency. It does not need a customer `.env` file or an account-specific environment value. `PROFIT_PILOT_API_URL` is an optional developer override; the production API origin is currently in `bridge/connector_core.py`.
+Pairing exchanges the short-lived code for a device credential. The connector stores that credential encrypted with the current Windows user's DPAPI and retrieves the account credentials from the server over its authenticated WebSocket connection. It does not require a Python installation or a customer `.env` file.
 
-For the reproducible executable build procedure, see [WINDOWS_CONNECTOR_BUILD.md](WINDOWS_CONNECTOR_BUILD.md). PyInstaller output is currently unsigned and must not be represented as a released installer.
+The connector can retain multiple paired accounts, but a single MT5 installation cannot be used for concurrent sessions. Use separate MT5 installation directories for simultaneous logins, or disconnect one account before connecting another. Stopping or forgetting a connector does not log out of MT5 or close positions.
 
-The existing environment-based worker instructions below are retained for developer use; the customer connector does not use or replace that setup.
+The executable is unsigned and is not a signed installer or production release. Build and smoke-test instructions are in [WINDOWS_CONNECTOR_BUILD.md](WINDOWS_CONNECTOR_BUILD.md). The desktop app source can be run with Python for development, but end users should use the packaged executable.
 
-## What actually starts here
+## Manual Python worker
 
-The authenticated remote worker entry point is:
+Use this mode when developing or diagnosing the bridge. It requires Windows 10/11, Python 3.11, the Windows `MetaTrader5` dependency, a local MT5 terminal, and a Profit Pilot server with `REMOTE_WORKER_ENABLED=true`.
 
-- `bridge/worker_identity.py`
-
-It connects to the backend WebSocket endpoint:
-
-- `ws://127.0.0.1:4000/api/worker-connect`
-
-It does not start `bridge/probe.py` or `bridge/health.py` directly. Instead, it authenticates with a worker token, then sends commands like `get_account`, `get_positions`, `get_candles`, and `place_order` through the backend-managed worker connection. The actual trading-capable MT5 bridge is the existing probe service reached via `MT5_BRIDGE_URL`.
-
-## Required prerequisites
-
-- Windows 10 or 11
-- Python 3.11.x
-- A local MT5 terminal installation with a demo account that you intend to exercise
-- The Node backend running with `REMOTE_WORKER_ENABLED=true`
-- A user-linked MT5 account in the app, plus a generated worker token from the backend
-
-## Local Windows setup
-
-From a PowerShell terminal in this folder:
+From PowerShell in this folder:
 
 ```powershell
 py -3.11 -m venv .venv
@@ -50,101 +32,53 @@ python -m pip install -r .\requirements-mt5-windows.txt
 Copy-Item .env.example .env
 ```
 
-Then populate the local `.env` file with placeholders only:
+Set the local `.env` values. Keep secrets on the machine and out of source control:
 
 ```ini
 PORT=8000
-MT5_TERMINAL_PATH=C:\\path\\to\\terminal\\terminal.exe
-MT5_AGENT_SECRET=
+MT5_BRIDGE_HOST=127.0.0.1
+MT5_TERMINAL_PATH=C:\\path\\to\\terminal64.exe
+MT5_AGENT_SECRET=replace-with-a-local-secret
 MT5_BRIDGE_URL=http://127.0.0.1:8000
 WORKER_IDENTITY_SERVER_URL=ws://127.0.0.1:4000/api/worker-connect
 WORKER_ID=windows-demo-worker
-WORKER_IDENTITY_TOKEN=
+WORKER_IDENTITY_TOKEN=paste-the-account-worker-token
 WORKER_RECONNECT_DELAY_SECONDS=2
 ```
 
-Do not commit any real `.env` file or credentials. Keep them local only.
+In the Profit Pilot app, create the MT5 account with its login, password, and exact server name. The server stores the password encrypted. Generate a worker token using `POST /api/mt5/accounts/:accountId/worker-token` and copy the returned token into `WORKER_IDENTITY_TOKEN`; it is returned only when issued. Do not put the account password in this `.env`.
 
-The sample `ws://` and `http://` URLs are for loopback development only. Use `wss://` for a remote backend and `https://` for a remote bridge because the authenticated connection carries the selected account password in memory.
+Open two PowerShell terminals in this folder. Start the local probe in the first:
 
-## MT5 terminal and broker setup
+```powershell
+.\.venv\Scripts\Activate.ps1
+python .\bridge\probe.py
+```
 
-1. Install the MT5 terminal and set `MT5_TERMINAL_PATH` to its executable.
-2. The selected customer account login, server, and password come from the backend's encrypted MT5 account record after worker-token authentication. Do not put customer-specific account fields in this `.env`.
-3. The backend sends that account config over the authenticated worker WebSocket. The worker holds it in memory and forwards it on each loopback bridge request; the probe uses it only for that request and does not persist it.
-
-The shared bridge secret and worker identity token remain local secrets and must not be committed.
-
-## Backend configuration and pairing
-
-The Node backend must be started with the remote worker enabled. Required config names are:
-
-- `REMOTE_WORKER_ENABLED=true`
-- `MT5_BRIDGE_URL` (the actual MT5 bridge HTTP URL)
-- `MT5_BRIDGE_SECRET` (must match `MT5_AGENT_SECRET` in the worker environment)
-- `MT5_WORKER_PYTHON` (optional override to the Python executable used to launch the local worker process)
-
-To generate a secure per-account worker token, create the MT5 account in the app and then call the existing backend route:
-
-- `POST /api/mt5/accounts/:accountId/worker-token`
-
-That returns a one-time token to copy into `WORKER_IDENTITY_TOKEN` for the worker process.
-
-Do not invent a pairing API; this flow is the implemented mechanism.
-
-## Worker startup
-
-From the `mt5-bridge-experiment` folder:
+Start the authenticated worker in the second:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 python .\bridge\worker_identity.py
 ```
 
-Equivalent module start:
+The worker connects to `/api/worker-connect`, receives the account configuration after token authentication, and forwards bridge requests to the local probe. It reconnects after network interruptions. `MT5_AGENT_SECRET` protects the local probe requests; if the server is also configured to launch its own local probe, set server `MT5_BRIDGE_SECRET` to the same value. Set `MT5_BRIDGE_HOST=127.0.0.1`: the probe otherwise binds to `0.0.0.0`. Do not expose Flask's development server directly to the internet; remote bridge access requires a properly secured HTTPS deployment.
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-python -m bridge.worker_identity
-```
+For a remote server, use `wss://` for `WORKER_IDENTITY_SERVER_URL` and `https://` for any remote bridge URL. The worker rejects non-loopback `ws://` and `http://` URLs. Do not send account passwords over an unencrypted remote connection.
 
-./.venv/Scripts/python.exe ./bridge/probe.py
+## Server-side setup
 
-This is the authenticated remote MT5 worker. It listens to the backend worker identity socket and reconnects automatically on loss of connection.
+The server must have MongoDB configured, and `REMOTE_WORKER_ENABLED=true` to accept authenticated workers on `/api/worker-connect`. The manual worker uses an account worker token; the desktop connector instead obtains a device credential through a pairing code generated in the app. See [server API documentation](../server/api/README.md) for environment settings, pairing/device management, and the HTTP/WebSocket routes.
 
-## Connection verification
-
-Before attempting any order activity, verify the backend-selected worker is online:
-
-1. Start the Node backend with `REMOTE_WORKER_ENABLED=true`.
-2. Confirm the MT5 account is attached to the correct user.
-3. Confirm the worker is connected by checking the MT5 account worker status route.
-4. Confirm the worker identity handshake is accepted by the backend.
-5. Confirm the account and terminal match the bound account login/server.
-
-The backend uses `findMt5WorkerIdentity` and `workerConnections` to bind the worker to a specific account. If no worker is connected for that account, routing fails with an explicit 404/503 error rather than silently falling back to a local in-process MT5 terminal.
+Connector pairing codes expire after five minutes and can only be exchanged once. The server can list, rotate, or revoke paired devices; revoking or rotating a credential disconnects that connector.
 
 ## Troubleshooting
 
-- `WORKER_IDENTITY_TOKEN` is missing or invalid: verify the token generated for the exact MT5 account.
-- Worker says `Server did not acknowledge worker identity`: confirm the backend is running and the worker socket endpoint is reachable.
-- `MT5 probe is unreachable`: confirm `MT5_BRIDGE_URL` and `MT5_AGENT_SECRET` match the bridge service.
-- `Connected MT5 login does not match the bound account`: verify the demo account login and server match the user’s configured MT5 account.
-- `MT5 terminal is not connected` or `tradeAllowed` is false: the terminal must be running and logged into the correct demo account.
-- Repeated disconnects: the worker automatically reconnects, but the backend still requires a healthy, bound MT5 account.
+- **Pairing code invalid or expired:** generate a new code in the app and exchange it promptly.
+- **Worker identity rejected:** check that `REMOTE_WORKER_ENABLED=true`, the backend is reachable, and the token belongs to the intended account.
+- **Probe unreachable or bridge secret rejected:** confirm `probe.py` is running and `MT5_AGENT_SECRET` matches the worker's local configuration.
+- **Login or server mismatch:** check the selected terminal and the account record in Profit Pilot.
+- **Terminal unavailable or trading not allowed:** open MT5, sign in to the bound demo account, and enable algorithmic trading if required by the terminal.
+- **Connector cannot use terminal:** close the other connector session using that same terminal installation, or select a separate MT5 directory.
 
-## Shutdown
-
-Stop the worker with Ctrl+C in the terminal. If the Node backend is also running locally, shut it down after the worker exits.
-
-## Known blocker for the first remote demo test
-
-A real remote MT5 demo test is blocked until all of the following are available and verified:
-
-- a valid Windows MT5 terminal installation
-- a demo account login/server that matches the bound user MT5 account
-- a generated worker token for that exact account
-- a reachable backend URL and matching bridge secret
-- a running MT5 bridge service that reports the expected account identity
-
-No real broker credentials or shared secrets should be stored in this repo.
+Never commit `.env` files, worker tokens, device credentials, or real broker credentials.

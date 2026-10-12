@@ -143,6 +143,20 @@ class BoundAccountPreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "server does not match"):
             validate_bound_account(self.account_health, '123456', 'Other-Demo')
 
+    def test_two_backend_accounts_are_verified_against_their_own_login_and_server(self):
+        capital = {
+            "account": {"login": "1048288", "server": "Capital-Demo", "trade_mode": 0},
+            "terminal": {"connected": True, "tradeAllowed": True},
+        }
+        deriv = {
+            "account": {"login": "2000012", "server": "Deriv-Demo", "trade_mode": 0},
+            "terminal": {"connected": True, "tradeAllowed": True},
+        }
+        validate_bound_account(capital, "1048288", "capital-demo")
+        validate_bound_account(deriv, "2000012", "deriv-demo")
+        with self.assertRaisesRegex(ValueError, "login does not match"):
+            validate_bound_account(deriv, "1048288", "capital-demo")
+
     def test_rejects_disconnected_or_trade_disabled_terminal(self):
         disconnected = {
             **self.account_health,

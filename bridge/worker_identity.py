@@ -14,6 +14,13 @@ from urllib.request import Request, urlopen
 from dotenv import load_dotenv
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
+try:
+    from .diagnostics import log_diagnostic
+except ImportError:
+    try:
+        from diagnostics import log_diagnostic
+    except ImportError:
+        from bridge.diagnostics import log_diagnostic
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -628,6 +635,14 @@ async def run_connection(
             raise RuntimeError("Server did not acknowledge worker identity")
 
         account_config = validate_worker_account_config(response)
+        log_diagnostic(
+            "worker_identity_acknowledged",
+            response.get("accountId"),
+            worker_id=response.get("workerId"),
+            account_id=response.get("accountId"),
+            configured_login_suffix=account_config["login"][-4:],
+            configured_server=account_config["server"],
+        )
         print(
             "Identity accepted: "
             f"worker={response['workerId']} user={response['userId']} "
@@ -839,6 +854,11 @@ async def run_connection(
                 if command.get("command") != "get_account":
                     raise RuntimeError("Server requested an unsupported command")
 
+                log_diagnostic(
+                    "worker_account_check_requested",
+                    account_config.get("accountId"),
+                    request_id=command.get("requestId"),
+                )
                 try:
                     health = await asyncio.to_thread(
                         fetch_account_summary, account_config
@@ -849,6 +869,15 @@ async def run_connection(
                         expected_server,
                         require_trade_allowed=False,
                     )
+                    login = str(health["account"].get("login", ""))
+                    server = str(health["account"].get("server", ""))
+                    log_diagnostic(
+                        "worker_account_verification_succeeded",
+                        account_config.get("accountId"),
+                        login_suffix=login[-4:],
+                        server=server,
+                        trade_allowed=(health.get("terminal") or {}).get("tradeAllowed"),
+                    )
                     result = {
                         "type": "result",
                         "requestId": command.get("requestId"),
@@ -856,10 +885,27 @@ async def run_connection(
                         **health,
                     }
                     print(
+                        "Verified MT5 account: "
+                        f"login ending {login[-4:]}; "
+                        f"server={health['account'].get('server', '')}"
+                    )
+                    trade_allowed = (health.get("terminal") or {}).get("tradeAllowed")
+                    trade_allowed_label = (
+                        "Yes" if trade_allowed is True
+                        else "No" if trade_allowed is False
+                        else "Unknown"
+                    )
+                    print(f"MT5 trade allowed: {trade_allowed_label}")
+                    print(
                         "Read-only account result returned; fields: "
                         + ", ".join(health["account"].keys())
                     )
                 except (RuntimeError, ValueError) as error:
+                    log_diagnostic(
+                        "worker_account_verification_failed",
+                        account_config.get("accountId"),
+                        reason=str(error),
+                    )
                     result = {
                         "type": "result",
                         "requestId": command.get("requestId"),
@@ -869,6 +915,12 @@ async def run_connection(
                     print(f"Read-only account request failed: {error}")
 
                 await connection.send(json.dumps(result))
+                log_diagnostic(
+                    "worker_account_result_emitted",
+                    account_config.get("accountId"),
+                    ok=result.get("ok") is True,
+                    request_id=result.get("requestId"),
+                )
         finally:
             heartbeat_task.cancel()
             with suppress(asyncio.CancelledError):

@@ -84,27 +84,56 @@ class WindowsCredentialStore:
         self.protect = protect
         self.unprotect = unprotect
 
-    def load(self):
+    @staticmethod
+    def _valid_record(record):
+        required = ("connectorId", "accountId", "credential", "serverUrl", "terminalPath")
+        return isinstance(record, dict) and all(
+            isinstance(record.get(key), str) and record[key] for key in required
+        )
+
+    def _read_payload(self):
         try:
             encrypted = self.path.read_bytes()
-        except FileNotFoundError:
-            return None
-        except OSError:
+        except (FileNotFoundError, OSError):
             return None
         try:
-            record = json.loads(self.unprotect(encrypted).decode("utf-8"))
+            return json.loads(self.unprotect(encrypted).decode("utf-8"))
         except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
             return None
-        required = ("connectorId", "accountId", "credential", "serverUrl", "terminalPath")
-        if not isinstance(record, dict) or not all(isinstance(record.get(key), str) and record[key] for key in required):
-            return None
-        return record
+
+    def load(self):
+        records = self.load_all()
+        return records[0] if records else None
+
+    def load_all(self):
+        payload = self._read_payload()
+        if self._valid_record(payload):
+            return [payload]
+        if not isinstance(payload, dict) or payload.get("version") != 2:
+            return []
+        records = payload.get("records")
+        if not isinstance(records, list):
+            return []
+        return [record for record in records if self._valid_record(record)]
 
     def save(self, record):
-        required = ("connectorId", "accountId", "credential", "serverUrl", "terminalPath")
-        if not isinstance(record, dict) or not all(isinstance(record.get(key), str) and record[key] for key in required):
+        if not self._valid_record(record):
             raise ValueError("Connector credential record is incomplete")
-        encrypted = self.protect(json.dumps(record, separators=(",", ":")).encode("utf-8"))
+        records = [existing for existing in self.load_all() if existing["connectorId"] != record["connectorId"]]
+        records.append(dict(record))
+        self.save_all(records)
+
+    def save_all(self, records):
+        if not isinstance(records, list) or any(not self._valid_record(record) for record in records):
+            raise ValueError("Connector credential records are incomplete")
+        connector_ids = [record["connectorId"] for record in records]
+        if len(connector_ids) != len(set(connector_ids)):
+            raise ValueError("Connector IDs must be unique")
+        if not records:
+            self.delete()
+            return
+        payload = {"version": 2, "records": records}
+        encrypted = self.protect(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary_path = tempfile.mkstemp(prefix="connector-", dir=self.path.parent)
         try:
@@ -119,7 +148,16 @@ class WindowsCredentialStore:
             except FileNotFoundError:
                 pass
 
-    def delete(self):
+    def delete(self, connector_id=None):
+        if connector_id is not None:
+            records = [
+                record
+                for record in self.load_all()
+                if record["connectorId"] != str(connector_id)
+            ]
+            if records:
+                self.save_all(records)
+                return
         try:
             self.path.unlink()
         except FileNotFoundError:

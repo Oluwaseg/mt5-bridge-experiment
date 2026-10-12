@@ -1,8 +1,11 @@
 import asyncio
+import ctypes
+import hashlib
 import json
 import ipaddress
 import os
 import platform
+import re
 import runpy
 import secrets
 import subprocess
@@ -15,6 +18,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
+from .diagnostics import diagnostic_path, log_diagnostic
 
 DEFAULT_API_BASE_URL = "https://server--profit-pilot-server--w46tx4dn8rj4.code.run/api"
 CONNECTOR_NAME = "Profit Pilot Connector"
@@ -156,6 +160,114 @@ def terminate_owned_process(process, timeout=5):
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=timeout)
+
+
+def owned_process_descendants(parent_pid):
+    if os.name != "nt":
+        return []
+
+    from ctypes import wintypes
+
+    class ProcessEntry32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    snapshot = kernel32.CreateToolhelp32Snapshot
+    snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    snapshot.restype = wintypes.HANDLE
+    first = kernel32.Process32FirstW
+    first.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32)]
+    first.restype = wintypes.BOOL
+    next_process = kernel32.Process32NextW
+    next_process.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32)]
+    next_process.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    invalid_handle = ctypes.c_void_p(-1).value
+    handle = snapshot(0x00000002, 0)
+    if handle == invalid_handle:
+        return []
+
+    try:
+        processes = {}
+        entry = ProcessEntry32()
+        entry.dwSize = ctypes.sizeof(ProcessEntry32)
+        has_entry = first(handle, ctypes.byref(entry))
+        while has_entry:
+            processes[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            has_entry = next_process(handle, ctypes.byref(entry))
+    finally:
+        close_handle(handle)
+
+    descendants = []
+    frontier = [int(parent_pid)]
+    seen = {int(parent_pid)}
+    while frontier:
+        current_parent = frontier.pop(0)
+        children = [
+            pid for pid, process_parent in processes.items()
+            if process_parent == current_parent and pid not in seen
+        ]
+        for child_pid in children:
+            seen.add(child_pid)
+            descendants.append(child_pid)
+            frontier.append(child_pid)
+    return descendants
+
+
+class TerminalInstanceLock:
+    def __init__(self, terminal_path):
+        canonical_path = os.path.normcase(os.path.realpath(terminal_path))
+        lock_name = hashlib.sha256(canonical_path.encode("utf-8")).hexdigest() + ".lock"
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home()))
+        self.path = base / "ProfitPilot" / "terminal-locks" / lock_name
+        self.stream = None
+
+    def acquire(self):
+        if os.name != "nt":
+            raise ConnectorError("MT5 terminal instance locks are available only on Windows.")
+        import msvcrt
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        stream = self.path.open("a+b")
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+        stream.seek(0)
+        try:
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            stream.close()
+            raise ConnectorError(
+                "Another Profit Pilot connector instance is using this MT5 installation. Stop that account or select a separate installation."
+            ) from None
+        self.stream = stream
+
+    def release(self):
+        if not self.stream:
+            return
+        import msvcrt
+
+        try:
+            self.stream.seek(0)
+            msvcrt.locking(self.stream.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            self.stream.close()
+            self.stream = None
 
 
 def smoke_test_bundled_bridge():
@@ -342,6 +454,10 @@ class ConnectorRunner:
         self.connected = False
         self.starting = False
         self._lock = threading.RLock()
+        self.terminal_lock = None
+        self._verified_identity = None
+        self._verified_trade_allowed = None
+        self._connected_reported = False
 
     @property
     def is_running(self):
@@ -349,6 +465,12 @@ class ConnectorRunner:
             return any(process.poll() is None for _name, process in self.processes)
 
     def start(self):
+        log_diagnostic(
+            "runner_start_requested",
+            self.record.get("connectorId"),
+            account_id=self.record.get("accountId"),
+            terminal_path=self.terminal_path,
+        )
         with self._lock:
             if self.starting or any(process.poll() is None for _name, process in self.processes):
                 self.status_callback("Connecting", "Connector components are already running.")
@@ -361,6 +483,9 @@ class ConnectorRunner:
                 raise ConnectorError("MT5 terminal not found. Select the installed terminal64.exe.")
             self.stop_event.clear()
             self.connected = False
+            self._verified_identity = None
+            self._verified_trade_allowed = None
+            self._connected_reported = False
             self.status_callback("Connecting", "Starting the local MT5 bridge and authenticating with Profit Pilot…")
         inherited_environment = (
             "PATH",
@@ -405,15 +530,26 @@ class ConnectorRunner:
             "REMOTE_WORKER_HEARTBEAT_INTERVAL_MS": "5000",
             "PROFIT_PILOT_CONNECTOR_MODE": "1",
             "PYTHON_DOTENV_DISABLED": "1",
+            "PYTHONUNBUFFERED": "1",
         })
         try:
+            self.terminal_lock = TerminalInstanceLock(self.terminal_path)
+            self.terminal_lock.acquire()
             self._spawn(["probe.py"], env)
             if self.stop_event.is_set():
                 raise OSError("The local MT5 bridge exited during startup")
             self._spawn(["worker_identity.py"], env)
-        except OSError:
+        except (OSError, ConnectorError) as error:
+            log_diagnostic(
+                "runner_start_failed",
+                self.record.get("connectorId"),
+                account_id=self.record.get("accountId"),
+                error=str(error),
+            )
             self.stop()
             self.status_callback("Error", "Could not start the connector components. Try restarting the app.")
+            if isinstance(error, ConnectorError):
+                raise
             raise ConnectorError("Could not start the local MT5 connector components.") from None
         finally:
             with self._lock:
@@ -440,6 +576,15 @@ class ConnectorRunner:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.processes.append((script_names[0], process))
+        self._output_tail = getattr(self, "_output_tail", {})
+        self._output_tail[script_names[0]] = []
+        log_diagnostic(
+            "worker_process_started" if script_names[0] == "worker_identity.py" else "bridge_process_started",
+            self.record.get("connectorId"),
+            account_id=self.record.get("accountId"),
+            component=script_names[0],
+            pid=getattr(process, "pid", None),
+        )
         output_thread = threading.Thread(
             target=self._read_output,
             args=(script_names[0], process),
@@ -453,24 +598,267 @@ class ConnectorRunner:
         self.threads.extend((output_thread, exit_thread))
         output_thread.start()
         exit_thread.start()
+        if script_names[0] == "worker_identity.py":
+            diagnostics_thread = threading.Thread(
+                target=self._read_worker_diagnostics,
+                args=(process,),
+                daemon=True,
+            )
+            self.threads.append(diagnostics_thread)
+            diagnostics_thread.start()
+
+    def _read_worker_diagnostics(self, process):
+        launcher_pid = int(getattr(process, "pid", os.getpid()))
+        offsets = {}
+        pending_by_pid = {}
+        worker_stages = {
+            "worker_identity_acknowledged",
+            "worker_account_check_requested",
+            "worker_account_verification_succeeded",
+            "worker_account_verification_failed",
+            "worker_account_result_emitted",
+        }
+        attached_pids = set()
+        log_diagnostic(
+            "worker_diagnostic_reader_started",
+            self.record.get("connectorId"),
+            worker_launcher_pid=launcher_pid,
+        )
+        while True:
+            descendant_pids = owned_process_descendants(launcher_pid)
+            candidate_pids = list(dict.fromkeys([*descendant_pids, launcher_pid]))
+            for candidate_pid in candidate_pids:
+                path = diagnostic_path(candidate_pid)
+                try:
+                    with path.open("rb") as stream:
+                        stream.seek(offsets.get(candidate_pid, 0))
+                        chunk = stream.read()
+                        offsets[candidate_pid] = stream.tell()
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    log_diagnostic(
+                        "worker_diagnostic_read_failed",
+                        self.record.get("connectorId"),
+                        worker_pid=candidate_pid,
+                        error=str(error),
+                    )
+                    continue
+
+                if not chunk:
+                    continue
+                pending = pending_by_pid.get(candidate_pid, b"") + chunk
+                records, separator, trailing = pending.rpartition(b"\n")
+                pending_by_pid[candidate_pid] = trailing if separator else pending
+                if not separator:
+                    continue
+                for raw_record in records.splitlines():
+                    try:
+                        entry = json.loads(raw_record.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        log_diagnostic(
+                            "worker_diagnostic_record_invalid",
+                            self.record.get("connectorId"),
+                            worker_pid=candidate_pid,
+                            byte_count=len(raw_record),
+                        )
+                        continue
+                    if (
+                        entry.get("pid") != candidate_pid
+                        or entry.get("stage") not in worker_stages
+                    ):
+                        continue
+                    if candidate_pid not in attached_pids:
+                        attached_pids.add(candidate_pid)
+                        log_diagnostic(
+                            "worker_diagnostic_reader_attached",
+                            self.record.get("connectorId"),
+                            launcher_pid=launcher_pid,
+                            worker_pid=candidate_pid,
+                        )
+                    self._handle_worker_diagnostic_event(entry)
+
+            if process.poll() is not None:
+                if not any(
+                    diagnostic_path(pid).exists()
+                    and offsets.get(pid, 0) < diagnostic_path(pid).stat().st_size
+                    for pid in candidate_pids
+                ):
+                    break
+                continue
+            threading.Event().wait(0.1)
+
+        for candidate_pid, pending in pending_by_pid.items():
+            if not pending:
+                continue
+            try:
+                entry = json.loads(pending.decode("utf-8"))
+                if entry.get("pid") == candidate_pid and entry.get("stage") in worker_stages:
+                    self._handle_worker_diagnostic_event(entry)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                log_diagnostic(
+                    "worker_diagnostic_trailing_record_invalid",
+                    self.record.get("connectorId"),
+                    worker_pid=candidate_pid,
+                    byte_count=len(pending),
+                )
+        log_diagnostic(
+            "worker_diagnostic_reader_finished",
+            self.record.get("connectorId"),
+            worker_launcher_pid=launcher_pid,
+            worker_pids=sorted(attached_pids),
+        )
+
+    def _handle_worker_diagnostic_event(self, entry):
+        if not isinstance(entry, dict):
+            return
+        fields = entry.get("fields")
+        if not isinstance(fields, dict):
+            return
+        stage = entry.get("stage")
+        if stage == "worker_account_verification_succeeded":
+            identity = (
+                f"login ending {fields.get('login_suffix', '')}; "
+                f"server={fields.get('server', '')}"
+            )
+            if not re.fullmatch(r"login ending \d{4}; server=.{1,128}", identity):
+                log_diagnostic(
+                    "worker_ipc_identity_invalid",
+                    self.record.get("connectorId"),
+                    worker_event=stage,
+                )
+                return
+            log_diagnostic(
+                "worker_ipc_identity_received",
+                self.record.get("connectorId"),
+                login_suffix=fields.get("login_suffix"),
+                server=fields.get("server"),
+            )
+            self._report_verified_identity(identity)
+            trade_allowed = fields.get("trade_allowed")
+            self._verified_trade_allowed = trade_allowed if isinstance(trade_allowed, bool) else None
+        elif stage == "worker_account_result_emitted":
+            if fields.get("ok") is True:
+                log_diagnostic(
+                    "worker_ipc_account_result_received",
+                    self.record.get("connectorId"),
+                    ok=True,
+                )
+                self._report_connected()
+            else:
+                self._report_verification_failed("Worker reported an unsuccessful account verification.")
+        elif stage == "worker_account_verification_failed":
+            reason = fields.get("reason", "Account verification failed.")
+            log_diagnostic(
+                "worker_ipc_verification_failure_received",
+                self.record.get("connectorId"),
+                reason=reason,
+            )
+            self._report_verification_failed(str(reason))
+        elif stage == "worker_identity_acknowledged":
+            log_diagnostic(
+                "worker_ipc_backend_authenticated",
+                self.record.get("connectorId"),
+                account_id=fields.get("account_id"),
+            )
+            self.status_callback(
+                "_backend_connected",
+                "Backend authenticated; MT5 account verification pending.",
+            )
+
+    def _report_verified_identity(self, identity):
+        if identity == self._verified_identity:
+            return
+        self._verified_identity = identity
+        self.status_callback("_account", identity)
+
+    def _report_connected(self):
+        if self._connected_reported:
+            return
+        self._connected_reported = True
+        self.connected = True
+        trade_allowed_label = (
+            "Yes" if self._verified_trade_allowed is True
+            else "No" if self._verified_trade_allowed is False
+            else "Unknown"
+        )
+        self.status_callback(
+            "Connected",
+            "MT5 login and server match the paired account. "
+            f"MT5 terminal reports trading allowed: {trade_allowed_label}. "
+            "This does not guarantee every trade can execute.",
+        )
+
+    def _report_verification_failed(self, detail):
+        self._connected_reported = False
+        self.connected = False
+        self.stop()
+        self.status_callback("Error", detail)
 
     def _read_output(self, script_name, process):
         stream = process.stdout
         if stream is None:
+            log_diagnostic("worker_output_stream_missing", self.record.get("connectorId"), component=script_name)
             return
         for line in stream:
             if self.stop_event.is_set():
+                log_diagnostic("worker_output_reader_stopped", self.record.get("connectorId"), component=script_name)
                 return
-            self._handle_line(script_name, line.strip())
+            raw_line = line.rstrip("\r\n")
+            output_tail = getattr(self, "_output_tail", {}).setdefault(script_name, [])
+            output_tail.append(raw_line)
+            del output_tail[:-12]
+            log_diagnostic(
+                "worker_output_received",
+                self.record.get("connectorId"),
+                component=script_name,
+                raw_output=raw_line,
+            )
+            self._handle_line(script_name, raw_line.strip())
 
     def _handle_line(self, script_name, line):
+        message_type = "unmatched"
+        valid = False
         if script_name == "worker_identity.py":
             if line.startswith("Identity accepted:"):
-                self.status_callback("Connecting", "Authenticated. Verifying the assigned MT5 account…")
+                message_type, valid = "identity_accepted", True
+                self.status_callback(
+                    "_backend_connected",
+                    "Backend authenticated; MT5 account verification pending.",
+                )
+            elif line.startswith("Verified MT5 account:"):
+                identity = line.partition(":")[2].strip()
+                match = re.fullmatch(r"login ending\s+(\d{4});\s*server=(.{1,128})", identity)
+                valid = bool(
+                    match
+                    and match.group(2).strip()
+                    and not any(ord(character) < 32 for character in identity)
+                )
+                message_type = "account_identity_verified"
+                log_diagnostic(
+                    "worker_message_parsed",
+                    self.record.get("connectorId"),
+                    component=script_name,
+                    message_type=message_type,
+                    valid=valid,
+                    login_suffix=match.group(1) if match else "invalid",
+                    server=match.group(2).strip() if match else "invalid",
+                )
+                if valid:
+                    self._report_verified_identity(identity)
+                return
+            elif line.startswith("MT5 trade allowed:"):
+                value = line.partition(":")[2].strip().casefold()
+                labels = {"yes": True, "no": False, "unknown": None}
+                valid = value in labels
+                message_type = "account_trade_permission"
+                if valid:
+                    self._verified_trade_allowed = labels[value]
             elif line.startswith("Read-only account result returned"):
-                self.connected = True
-                self.status_callback("Connected", "MT5 terminal and assigned account verified.")
+                message_type, valid = "account_result_success", True
+                self._report_connected()
             elif line.startswith("Read-only account request failed:"):
+                message_type, valid = "account_result_failure", True
                 lowered = line.casefold()
                 if "login does not match" in lowered or "server does not match" in lowered:
                     detail = "The selected MT5 account does not match the account assigned by Profit Pilot. Check the selected terminal and account details."
@@ -480,10 +868,9 @@ class ConnectorRunner:
                     detail = "The MT5 terminal or MetaTrader5 Python component is unavailable. Verify the terminal installation and restart the connector."
                 else:
                     detail = "Could not verify the assigned MT5 account. Check the selected terminal and network connection."
-                self.connected = False
-                self.stop()
-                self.status_callback("Error", detail)
+                self._report_verification_failed(detail)
             elif "Worker connection ended" in line:
+                message_type, valid = "worker_connection_ended", True
                 self.connected = False
                 lowered = line.casefold()
                 if any(
@@ -509,14 +896,33 @@ class ConnectorRunner:
                     detail = "Connection interrupted. The connector will retry automatically."
                 self.status_callback("Disconnected", detail)
             elif "Connected MT5 login" in line or "Connected MT5 server" in line:
+                message_type, valid = "legacy_account_mismatch", True
                 self.connected = False
                 self.status_callback("Error", "The selected terminal does not match the account assigned by Profit Pilot.")
         elif script_name == "probe.py" and "Running on" in line:
+            message_type, valid = "bridge_ready", True
             if not self.connected:
                 self.status_callback("Connecting", "Local MT5 bridge started. Authenticating connector…")
+        log_diagnostic(
+            "worker_message_parsed",
+            self.record.get("connectorId"),
+            component=script_name,
+            message_type=message_type,
+            valid=valid,
+        )
 
     def _watch_exit(self, script_name, process):
         code = process.wait()
+        log_diagnostic(
+            "worker_process_exited" if script_name == "worker_identity.py" else "bridge_process_exited",
+            self.record.get("connectorId"),
+            account_id=self.record.get("accountId"),
+            component=script_name,
+            pid=getattr(process, "pid", None),
+            exit_code=code,
+            captured_output_tail=getattr(self, "_output_tail", {}).get(script_name, []),
+            stderr="merged into stdout by connector subprocess configuration",
+        )
         if self.stop_event.is_set():
             return
         if script_name == "worker_identity.py" and code in (20, 21, 22):
@@ -545,6 +951,12 @@ class ConnectorRunner:
             self.status_callback("Error", "Worker stopped unexpectedly. Restart the connector and check the network connection.")
 
     def stop(self):
+        log_diagnostic(
+            "runner_stop_started",
+            self.record.get("connectorId"),
+            process_count=len(self.processes),
+            account_id=self.record.get("accountId"),
+        )
         with self._lock:
             self.stop_event.set()
             self.connected = False
@@ -552,8 +964,27 @@ class ConnectorRunner:
             threads, self.threads = self.threads, []
         for _name, process in processes:
             try:
+                log_diagnostic(
+                    "owned_process_termination_started",
+                    self.record.get("connectorId"),
+                    component=_name,
+                    pid=getattr(process, "pid", None),
+                )
                 terminate_owned_process(process)
+                log_diagnostic(
+                    "owned_process_termination_completed",
+                    self.record.get("connectorId"),
+                    component=_name,
+                    pid=getattr(process, "pid", None),
+                    exit_code=process.poll(),
+                )
             except OSError:
+                log_diagnostic(
+                    "owned_process_termination_failed",
+                    self.record.get("connectorId"),
+                    component=_name,
+                    pid=getattr(process, "pid", None),
+                )
                 pass
             stream = process.stdout
             if stream is not None and threading.current_thread() not in threads:
@@ -564,6 +995,23 @@ class ConnectorRunner:
         for thread in threads:
             if thread is not threading.current_thread():
                 thread.join(timeout=1)
+        if self.terminal_lock:
+            self.terminal_lock.release()
+            self.terminal_lock = None
+        log_diagnostic("runner_stop_completed", self.record.get("connectorId"))
+
+
+class ConnectorSession:
+    def __init__(self, record):
+        self.record = dict(record)
+        self.runner = None
+        self.status = "Disconnected"
+        self.detail = "Paired on this PC. Start this account's connector to connect."
+        self.backend_state = "Disconnected"
+        self.mt5_state = "Not verified"
+        self.identity = ""
+        self.last_update = None
+        self.generation = 0
 
 
 class ConnectorController:
@@ -571,84 +1019,279 @@ class ConnectorController:
         self.credential_store = credential_store
         self.runner_factory = runner_factory
         self.exchange = exchange
-        self.runner = None
-        self.record = self.credential_store.load()
+        loader = getattr(self.credential_store, "load_all", None)
+        records = loader() if loader else []
+        if not records:
+            legacy = self.credential_store.load()
+            records = [legacy] if legacy else []
+        self.sessions = {
+            record["connectorId"]: ConnectorSession(record)
+            for record in records
+            if isinstance(record, dict) and record.get("connectorId")
+        }
         self._lock = threading.RLock()
-        self._generation = 0
 
     @property
     def paired(self):
-        return bool(self.record)
+        return bool(self.sessions)
+
+    @property
+    def record(self):
+        return next(iter(self.sessions.values())).record if len(self.sessions) == 1 else None
 
     @property
     def running(self):
-        return bool(self.runner and self.runner.is_running)
+        return any(session.runner and session.runner.is_running for session in self.sessions.values())
 
-    def _new_status_callback(self, callback):
-        self._generation += 1
-        generation = self._generation
+    def _persist(self, records=None):
+        if records is None:
+            records = [session.record for session in self.sessions.values()]
+        saver = getattr(self.credential_store, "save_all", None)
+        if saver:
+            saver(records)
+            return
+        if len(records) > 1:
+            raise ConnectorError("This credential store cannot safely persist multiple account pairings.")
+        if records:
+            self.credential_store.save(records[0])
+        else:
+            self.credential_store.delete()
 
+    def _session_callback(self, connector_id, generation, callback):
         def report(state, detail):
             with self._lock:
-                if generation != self._generation:
+                session = self.sessions.get(connector_id)
+                if not session or session.generation != generation:
+                    log_diagnostic("session_callback_discarded", connector_id, state=state, generation=generation)
                     return
+                before = {
+                    "status": session.status,
+                    "backend_state": session.backend_state,
+                    "mt5_state": session.mt5_state,
+                    "identity_present": bool(session.identity),
+                    "verified_at_present": bool(session.record.get("lastVerifiedAt")),
+                }
+                if state == "_account":
+                    session.identity = detail
+                    session.mt5_state = "Verified"
+                    session.record["identitySummary"] = detail
+                    session.record["lastVerifiedAt"] = time.time()
+                    try:
+                        self._persist()
+                    except (OSError, ValueError):
+                        pass
+                elif state == "_backend_connected":
+                    session.backend_state = "Connected"
+                    session.mt5_state = "Verifying"
+                    session.status = "Connecting"
+                    session.detail = detail
+                    session.last_update = time.time()
+                elif state == "Connected":
+                    session.backend_state = "Connected"
+                    session.mt5_state = "Verified"
+                    session.status = "Connected"
+                    session.detail = detail
+                    session.last_update = time.time()
+                else:
+                    session.status = state
+                    session.detail = detail
+                    session.last_update = time.time()
+                    if state == "Connecting":
+                        if session.backend_state != "Connected":
+                            session.backend_state = "Connecting"
+                        if session.mt5_state != "Verified":
+                            session.mt5_state = "Verifying"
+                    elif state == "Disconnected":
+                        session.backend_state = "Disconnected"
+                        session.mt5_state = "Not verified"
+                    elif state == "Access revoked":
+                        session.backend_state = "Access revoked"
+                        session.mt5_state = "Not verified"
+                    elif state == "Error":
+                        session.backend_state = "Disconnected"
+                        session.mt5_state = "Error"
+                after = {
+                    "status": session.status,
+                    "backend_state": session.backend_state,
+                    "mt5_state": session.mt5_state,
+                    "identity_present": bool(session.identity),
+                    "verified_at_present": bool(session.record.get("lastVerifiedAt")),
+                }
+                log_diagnostic(
+                    "session_state_updated",
+                    connector_id,
+                    state=state,
+                    account_id=session.record.get("accountId"),
+                    before=before,
+                    after=after,
+                )
             callback(state, detail)
 
         return report
 
-    def pair(self, code, terminal_path, api_base_url, status_callback):
+    def pair(self, code, terminal_path, api_base_url, status_callback, display_name=""):
+        record = self.exchange(code, api_base_url)
+        record["serverUrl"] = worker_websocket_url(api_base_url)
+        record["terminalPath"] = str(terminal_path)
+        record["displayName"] = str(display_name or "MT5 account").strip()[:64]
         with self._lock:
-            if self.record:
-                raise ConnectorError(
-                    "This connector supports one MT5 account at a time. Disconnect and forget this pairing before pairing another account."
-                )
-            callback = self._new_status_callback(status_callback)
-            record = self.exchange(code, api_base_url)
-            record["serverUrl"] = worker_websocket_url(api_base_url)
-            record["terminalPath"] = str(terminal_path)
-            self.credential_store.save(record)
-            self.record = record
-            self.runner = self.runner_factory(record, terminal_path, callback)
-            self.runner.start()
+            if record["connectorId"] in self.sessions:
+                raise ConnectorError("Profit Pilot returned an already-saved connector ID.")
+            session = ConnectorSession(record)
+            self.sessions[record["connectorId"]] = session
+            session.generation += 1
+            self._persist()
+        try:
+            self.start(
+                record["connectorId"],
+                lambda state, detail: status_callback(record["connectorId"], state, detail),
+                terminal_path,
+            )
+        except ConnectorError as error:
+            with self._lock:
+                session.status = "Error"
+                session.detail = str(error)
+            status_callback(record["connectorId"], "Error", str(error))
+        return record["connectorId"]
 
-    def start(self, terminal_path, status_callback):
+    def start(self, connector_id, status_callback, terminal_path=None):
         with self._lock:
-            if not self.record:
-                raise ConnectorError("Enter a pairing code from your Profit Pilot MT5 account first.")
-            if self.runner and self.runner.is_running:
-                status_callback("Connecting", "Connector is already running for the paired account.")
+            session = self.sessions.get(connector_id)
+            if not session:
+                raise ConnectorError("This account pairing is no longer saved.")
+            if session.status == "Access revoked":
+                raise ConnectorError("Access was revoked. Forget this pairing and pair the account again.")
+            if session.runner and session.runner.is_running:
+                status_callback("Connecting", "This account's connector is already running.")
                 return
-            if self.runner:
-                self.runner.stop()
-            selected_terminal = str(terminal_path or self.record.get("terminalPath") or "")
+            selected_terminal = str(terminal_path or session.record.get("terminalPath") or "")
             if not selected_terminal or not Path(selected_terminal).is_file():
-                raise ConnectorError("MT5 terminal not found. Select the installed terminal64.exe.")
-            self.record["terminalPath"] = selected_terminal
-            self.credential_store.save(self.record)
-            callback = self._new_status_callback(status_callback)
-            self.runner = self.runner_factory(self.record, selected_terminal, callback)
-            self.runner.start()
+                message = "MT5 terminal not found. Select the installed terminal64.exe."
+                session.status, session.detail = "Error", message
+                status_callback("Error", message)
+                raise ConnectorError(message)
+            terminal_key = os.path.normcase(os.path.realpath(selected_terminal))
+            for other_id, other in self.sessions.items():
+                if other_id == connector_id or not other.runner:
+                    continue
+                active = other.runner.is_running or other.status in {"Starting", "Connecting", "Connected"}
+                if active and os.path.normcase(os.path.realpath(other.runner.terminal_path)) == terminal_key:
+                    message = "Another account is using this MT5 installation. Stop it or select a separate MT5 installation/data folder for concurrent connections."
+                    session.status, session.detail = "Error", message
+                    status_callback("Error", message)
+                    raise ConnectorError(message)
+            for other_id, other in self.sessions.items():
+                active = other.runner and (
+                    other.runner.is_running or other.status in {"Starting", "Connecting", "Connected"}
+                )
+                if other_id != connector_id and active and other.record["accountId"] == session.record["accountId"]:
+                    message = "This Profit Pilot account already has a running connector on this PC."
+                    session.status, session.detail = "Error", message
+                    status_callback("Error", message)
+                    raise ConnectorError(message)
+            session.record["terminalPath"] = selected_terminal
+            session.generation += 1
+            callback = self._session_callback(connector_id, session.generation, status_callback)
+            session.status = "Starting"
+            session.detail = "Starting this account's bridge and worker…"
+            session.backend_state = "Connecting"
+            session.mt5_state = "Not verified"
+            session.runner = self.runner_factory(session.record, selected_terminal, callback)
+            self._persist()
+            runner = session.runner
+        try:
+            runner.start()
+        except Exception as error:
+            with self._lock:
+                session.status = "Error"
+                session.detail = str(error)
+                log_diagnostic(
+                    "session_start_failed",
+                    connector_id,
+                    account_id=session.record.get("accountId"),
+                    status=session.status,
+                    error=str(error),
+                )
+            raise
 
-    def stop(self, status_callback=None):
+    def stop(self, connector_id, status_callback=None):
         with self._lock:
-            self._generation += 1
-            callback = self._new_status_callback(status_callback) if status_callback else None
-            runner, self.runner = self.runner, None
+            session = self.sessions.get(connector_id)
+            if not session:
+                return
+            session.generation += 1
+            callback = self._session_callback(connector_id, session.generation, status_callback) if status_callback else None
+            runner, session.runner = session.runner, None
+            session.status = "Stopping"
+            session.detail = "Stopping this account's worker and bridge…"
+            session.backend_state = "Stopping"
             if runner:
                 runner.stop()
             if callback:
-                callback("Disconnected", "Connector stopped. The paired credential remains saved on this PC.")
+                callback("Disconnected", "This connector stopped. Its pairing remains saved on this PC.")
+            else:
+                session.status = "Disconnected"
+                session.detail = "This connector stopped. Its pairing remains saved on this PC."
+                session.backend_state = "Disconnected"
+                session.mt5_state = "Not verified"
 
-    def disconnect(self):
+    def disconnect(self, connector_id):
         with self._lock:
-            self._generation += 1
-            runner, self.runner = self.runner, None
+            session = self.sessions.get(connector_id)
+            if not session:
+                return
+            log_diagnostic(
+                "forget_cleanup_started",
+                connector_id,
+                account_id=session.record.get("accountId"),
+                runner_present=bool(session.runner),
+            )
+            session.generation += 1
+            runner, session.runner = session.runner, None
             try:
                 if runner:
+                    log_diagnostic("forget_runner_stop_started", connector_id)
                     runner.stop()
-            finally:
-                self.record = None
-                self.credential_store.delete()
+                    log_diagnostic("forget_runner_stop_completed", connector_id)
+                remaining_records = [
+                    other.record
+                    for other_id, other in self.sessions.items()
+                    if other_id != connector_id
+                ]
+                self._persist(remaining_records)
+                del self.sessions[connector_id]
+                log_diagnostic("forget_local_credential_removed", connector_id)
+            except Exception as error:
+                session.status = "Error"
+                session.detail = "Could not remove this local credential. Retry Disconnect & Forget."
+                log_diagnostic(
+                    "forget_cleanup_failed",
+                    connector_id,
+                    account_id=session.record.get("accountId"),
+                    error=str(error),
+                )
+                raise
+
+    def status_snapshot(self):
+        with self._lock:
+            return [
+                {
+                    "connectorId": connector_id,
+                    "record": dict(session.record),
+                    "status": session.status,
+                    "detail": session.detail,
+                    "backendState": session.backend_state,
+                    "mt5State": session.mt5_state,
+                    "identity": session.identity,
+                    "lastUpdate": session.last_update,
+                    "running": bool(session.runner and session.runner.is_running),
+                }
+                for connector_id, session in self.sessions.items()
+            ]
+
+    def stop_all(self):
+        for connector_id in list(self.sessions):
+            self.stop(connector_id)
 
 
 class TkStatusApp:
@@ -665,27 +1308,34 @@ class TkStatusApp:
         self.api_base_url = api_base_url
         self.status_queue = __import__("queue").Queue()
         self._operation_id = 0
-        self._busy = False
+        self._pairing_busy = False
+        self._busy_sessions = set()
+        self._forgetting_sessions = set()
         self.root.title("Profit Pilot Connector")
-        self.root.geometry("500x430")
-        self.root.minsize(460, 390)
+        self.root.geometry("760x720")
+        self.root.minsize(620, 520)
+        self.terminal_options = discover_terminals()
 
         main = ttk.Frame(root, padding=20)
         main.pack(fill="both", expand=True)
         ttk.Label(main, text="Profit Pilot Connector", font=("Segoe UI", 18, "bold")).pack(anchor="w")
         ttk.Label(
             main,
-            text="Pair this computer with your selected MT5 account.",
+            text="Pair and manage each MT5 account independently.",
             wraplength=450,
         ).pack(anchor="w", pady=(4, 16))
 
         terminal_frame = ttk.LabelFrame(main, text="MT5 terminal", padding=10)
         terminal_frame.pack(fill="x", pady=(0, 12))
         self.terminal_var = tk.StringVar(value=(controller.record or {}).get("terminalPath", ""))
-        self.terminal_box = ttk.Combobox(terminal_frame, textvariable=self.terminal_var, values=discover_terminals())
+        self.terminal_box = ttk.Combobox(terminal_frame, textvariable=self.terminal_var, values=self.terminal_options)
         self.terminal_box.pack(side="left", fill="x", expand=True)
         ttk.Button(terminal_frame, text="Browse…", command=self._browse).pack(side="left", padx=(8, 0))
 
+        ttk.Label(main, text="Account label").pack(anchor="w")
+        self.label_var = tk.StringVar()
+        self.label_entry = ttk.Entry(main, textvariable=self.label_var)
+        self.label_entry.pack(fill="x", pady=(4, 8))
         ttk.Label(main, text="Temporary pairing code").pack(anchor="w")
         self.code_var = tk.StringVar()
         self.code_entry = ttk.Entry(main, textvariable=self.code_var, show="•")
@@ -696,32 +1346,44 @@ class TkStatusApp:
         self.action_frame.pack(fill="x")
         self.pair_button = ttk.Button(self.action_frame, text="Pair & Connect", command=self._pair)
         self.pair_button.pack(side="left")
-        self.control_button = ttk.Button(self.action_frame, text="Start Connector", command=self._toggle_connector)
-        self.control_button.pack(side="left", padx=(8, 0))
-        self.forget_button = ttk.Button(self.action_frame, text="Disconnect & Forget", command=self._disconnect)
-        self.forget_button.pack(side="right")
-
-        ttk.Separator(main).pack(fill="x", pady=16)
-        ttk.Label(main, text="Connection status", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        self.status_var = tk.StringVar(value="Disconnected" if controller.paired else "Not paired")
-        self.detail_var = tk.StringVar(
-            value=(
-                "This computer is paired but not running. Select the intended MT5 terminal and start the connector."
-                if controller.paired
-                else "Enter the temporary code shown on your Profit Pilot MT5 account."
-            )
+        ttk.Separator(main).pack(fill="x", pady=14)
+        self.accounts_frame = ttk.LabelFrame(main, text="Paired accounts", padding=8)
+        self.accounts_frame.pack(fill="both", expand=True)
+        self.accounts_canvas = tk.Canvas(self.accounts_frame, highlightthickness=0)
+        self.accounts_scrollbar = ttk.Scrollbar(
+            self.accounts_frame, orient="vertical", command=self.accounts_canvas.yview
         )
-        ttk.Label(main, textvariable=self.status_var, font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(4, 0))
-        ttk.Label(main, textvariable=self.detail_var, wraplength=450).pack(anchor="w", pady=(3, 0))
+        self.accounts_canvas.configure(yscrollcommand=self.accounts_scrollbar.set)
+        self.accounts_scrollbar.pack(side="right", fill="y")
+        self.accounts_canvas.pack(side="left", fill="both", expand=True)
+        self.accounts_body = ttk.Frame(self.accounts_canvas)
+        self.accounts_window = self.accounts_canvas.create_window(
+            (0, 0), window=self.accounts_body, anchor="nw"
+        )
+        self.accounts_body.bind(
+            "<Configure>",
+            lambda _event: self.accounts_canvas.configure(
+                scrollregion=self.accounts_canvas.bbox("all")
+            ),
+        )
+        self.accounts_canvas.bind(
+            "<Configure>",
+            lambda event: self.accounts_canvas.itemconfigure(
+                self.accounts_window, width=event.width
+            ),
+        )
+        self._rendered_rows = {}
+        self.pair_status_var = tk.StringVar(value="")
+        ttk.Label(main, textvariable=self.pair_status_var, wraplength=700).pack(anchor="w", pady=(6, 0))
 
         ttk.Label(
             main,
-            text="One connector instance pairs with one MT5 account. To switch accounts, Disconnect & Forget here, then pair the other account. Forget removes this PC's credential; revoke server access on the Profit Pilot website.",
-            wraplength=450,
+            text="Each account has its own worker and bridge. For simultaneous connections, use separate MT5 installations in different directories; the same terminal path cannot serve two active logins safely.",
+            wraplength=700,
             foreground="#555555",
         ).pack(anchor="w", pady=(16, 0))
         self.root.protocol("WM_DELETE_WINDOW", self._close)
-        self._refresh_controls()
+        self._render_sessions()
         self.root.after(200, self._drain_status)
 
     def _browse(self):
@@ -733,146 +1395,253 @@ class TkStatusApp:
             self.terminal_var.set(selected)
 
     def _pair(self):
-        if self._busy or self.controller.paired:
+        if self._pairing_busy:
             return
         code = self.code_var.get()
         terminal = self.terminal_var.get().strip()
         if not terminal or not Path(terminal).is_file():
-            self._set_status("Error", "Select the installed MT5 terminal executable before pairing.")
+            self.pair_status_var.set("Select the installed MT5 terminal executable before pairing.")
             return
-        operation_id = self._begin_operation()
-        self._set_status("Starting", "Exchanging the temporary pairing code and starting the connector…")
+        self._operation_id += 1
+        operation_id = self._operation_id
+        self._pairing_busy = True
+        self.pair_button.configure(state="disabled", text="Pairing…")
+        self.pair_status_var.set("Exchanging the temporary code and starting this account…")
         threading.Thread(
             target=self._pair_task,
-            args=(operation_id, code, terminal),
+            args=(operation_id, code, terminal, self.label_var.get().strip()),
             daemon=True,
         ).start()
 
-    def _pair_task(self, operation_id, code, terminal):
+    def _pair_task(self, operation_id, code, terminal, display_name):
         try:
-            self.controller.pair(
+            connector_id = self.controller.pair(
                 code,
                 terminal,
                 self.api_base_url,
-                self._status_callback(operation_id),
+                lambda key, state, detail: self._queue_session_status(key, state, detail),
+                display_name,
             )
-            self.status_queue.put((operation_id, "paired", "", ""))
+            self.status_queue.put(("pair_done", operation_id, connector_id, ""))
         except Exception as error:
-            self.status_queue.put((operation_id, "status", "Error", str(error)))
+            log_diagnostic("pairing_failed", fields_error=str(error))
+            self.status_queue.put(("pair_error", operation_id, "Error", str(error)))
         finally:
-            self.status_queue.put((operation_id, "done", "", ""))
+            self.status_queue.put(("pair_finished", operation_id, None, None))
 
-    def _toggle_connector(self):
-        if self._busy or not self.controller.paired:
+    def _toggle_session(self, connector_id, terminal_var=None):
+        if connector_id in self._busy_sessions:
             return
-        if self.status_var.get() == "Access revoked":
+        snapshot = next(
+            (item for item in self.controller.status_snapshot() if item["connectorId"] == connector_id),
+            None,
+        )
+        if not snapshot or snapshot["status"] == "Access revoked":
             return
-        operation_id = self._begin_operation()
-        if self.controller.running:
-            self._set_status("Stopping", "Stopping this connector's worker and local bridge…")
-            action = self._stop_task
+        self._busy_sessions.add(connector_id)
+        self._render_sessions()
+        if snapshot["running"]:
+            threading.Thread(target=self._stop_task, args=(connector_id,), daemon=True).start()
         else:
-            self._set_status("Starting", "Starting the local bridge and worker…")
-            action = self._start_task
-        threading.Thread(target=action, args=(operation_id,), daemon=True).start()
+            terminal_path = terminal_var.get().strip() if terminal_var else snapshot["record"].get("terminalPath", "")
+            threading.Thread(target=self._start_task, args=(connector_id, terminal_path), daemon=True).start()
 
-    def _start_task(self, operation_id):
+    def _start_task(self, connector_id, terminal_path):
         try:
-            self.controller.start(
-                self.terminal_var.get().strip(),
-                self._status_callback(operation_id),
-            )
+            self.controller.start(connector_id, lambda state, detail: self._queue_session_status(connector_id, state, detail), terminal_path)
         except ConnectorError as error:
-            self.status_queue.put((operation_id, "status", "Error", str(error)))
+            self.status_queue.put(("session", connector_id, "Error", str(error)))
         finally:
-            self.status_queue.put((operation_id, "done", "", ""))
+            self.status_queue.put(("session_done", connector_id, None, None))
 
-    def _stop_task(self, operation_id):
+    def _stop_task(self, connector_id):
         try:
-            self.controller.stop(self._status_callback(operation_id))
+            self.controller.stop(connector_id, lambda state, detail: self._queue_session_status(connector_id, state, detail))
         except Exception:
-            self.status_queue.put((operation_id, "status", "Error", "Could not fully stop the connector. Close the app and retry; MT5 itself was not asked to log out."))
+            self.status_queue.put(("session", connector_id, "Error", "Could not fully stop this connector. MT5 itself was not asked to log out."))
         finally:
-            self.status_queue.put((operation_id, "done", "", ""))
+            self.status_queue.put(("session_done", connector_id, None, None))
 
-    def _disconnect(self):
-        if self._busy or not self.controller.paired:
+    def _forget_session(self, connector_id):
+        snapshot = next(
+            (item for item in self.controller.status_snapshot() if item["connectorId"] == connector_id),
+            None,
+        )
+        if not snapshot or connector_id in self._busy_sessions:
             return
+        log_diagnostic("forget_confirmation_requested", connector_id)
+        record = snapshot["record"]
+        account_name = record.get("displayName") or "MT5 account"
+        identity_summary = snapshot["identity"] or record.get("identitySummary", "")
+        login_suffix = identity_summary.split(";", 1)[0].replace("login ending", "").strip()
+        target = f"{account_name} (login ending {login_suffix})" if login_suffix else account_name
         confirmed = self.messagebox.askyesno(
             "Disconnect & Forget",
-            "Stop this connector and remove its saved credential from this PC? This does not revoke the credential on the Profit Pilot website or change the MT5 account or positions.",
+            f"Disconnect and forget {target}?\n\nThis stops only this account's connector session, worker, and bridge, then removes its saved credential from this PC. The MT5 terminal will not be logged out and open positions will not be closed. The website credential may remain valid unless you separately revoke this device on the Profit Pilot dashboard.",
         )
         if not confirmed:
+            log_diagnostic("forget_confirmation_cancelled", connector_id)
             return
-        operation_id = self._begin_operation()
-        self._set_status("Stopping", "Stopping the worker and bridge, then removing the local credential…")
-        threading.Thread(target=self._forget_task, args=(operation_id,), daemon=True).start()
+        log_diagnostic("forget_confirmation_accepted", connector_id)
+        self._busy_sessions.add(connector_id)
+        self._forgetting_sessions.add(connector_id)
+        self._render_sessions()
+        threading.Thread(target=self._forget_task, args=(connector_id,), daemon=True).start()
 
-    def _forget_task(self, operation_id):
+    def _forget_task(self, connector_id):
+        log_diagnostic("forget_task_started", connector_id)
         try:
-            self.controller.disconnect()
-            self.status_queue.put((operation_id, "status", "Not paired", "Local credential removed. Revoke this device on the Profit Pilot website if server-side access should also be disabled."))
-        except Exception:
-            self.status_queue.put((operation_id, "status", "Error", "Local cleanup encountered an error. Check the connector credential file and retry Disconnect & Forget."))
+            self.controller.disconnect(connector_id)
+            log_diagnostic("forget_task_succeeded", connector_id)
+            self.status_queue.put(("forgotten", connector_id, None, None))
+        except Exception as error:
+            log_diagnostic("forget_task_failed", connector_id, error=str(error))
+            self.status_queue.put(("forget_failed", connector_id, None, None))
         finally:
-            self.status_queue.put((operation_id, "done", "", ""))
+            self.status_queue.put(("forget_finished", connector_id, None, None))
 
     def _close(self):
-        self._operation_id += 1
-        self.controller.stop()
+        self.controller.stop_all()
         self.root.destroy()
 
-    def _set_status(self, state, detail):
-        self.status_queue.put((self._operation_id, "status", state, detail))
+    def _queue_session_status(self, connector_id, state, detail):
+        log_diagnostic("ui_status_queued", connector_id, state=state, detail=detail)
+        self.status_queue.put(("session", connector_id, state, detail))
 
-    def _status_callback(self, operation_id):
-        return lambda state, detail: self.status_queue.put(
-            (operation_id, "status", state, detail)
-        )
-
-    def _begin_operation(self):
-        self._operation_id += 1
-        self._busy = True
-        self._refresh_controls()
-        return self._operation_id
-
-    def _refresh_controls(self):
-        paired = self.controller.paired
-        self.pair_button.configure(state="disabled" if paired or self._busy else "normal")
-        self.code_entry.configure(state="disabled" if paired or self._busy else "normal")
-        self.forget_button.configure(state="normal" if paired and not self._busy else "disabled")
-        if self._busy:
-            state = self.status_var.get()
-            label = "Stopping" if state == "Stopping" else "Starting"
-            self.control_button.configure(text=label, state="disabled")
-        elif not paired:
-            self.control_button.configure(text="Start Connector", state="disabled")
-        elif self.controller.running:
-            self.control_button.configure(text="Stop Connector", state="normal")
-        elif self.status_var.get() == "Access revoked":
-            self.control_button.configure(text="Start Connector", state="disabled")
-        else:
-            self.control_button.configure(text="Start Connector", state="normal")
+    def _render_sessions(self):
+        snapshots = self.controller.status_snapshot()
+        active_ids = {item["connectorId"] for item in snapshots}
+        for connector_id in set(self._rendered_rows) - active_ids:
+            self._rendered_rows.pop(connector_id)["frame"].destroy()
+        for item in snapshots:
+            connector_id = item["connectorId"]
+            widgets = self._rendered_rows.get(connector_id)
+            if widgets is None:
+                frame = self.ttk.LabelFrame(self.accounts_body, padding=8)
+                frame.pack(fill="x", pady=(0, 8))
+                title = self.ttk.Label(frame, font=("Segoe UI", 10, "bold"))
+                title.pack(anchor="w")
+                identity = self.ttk.Label(frame)
+                identity.pack(anchor="w", pady=(2, 0))
+                terminal_var = self.tk.StringVar(value="")
+                terminal_box = self.ttk.Combobox(
+                    frame,
+                    textvariable=terminal_var,
+                    values=self.terminal_options,
+                    width=70,
+                )
+                terminal_box.pack(fill="x", pady=(4, 2))
+                terminal = self.ttk.Label(frame)
+                terminal.pack(anchor="w", pady=(2, 0))
+                backend_state = self.ttk.Label(frame, font=("Segoe UI", 10, "bold"))
+                backend_state.pack(anchor="w", pady=(6, 0))
+                mt5_state = self.ttk.Label(frame, font=("Segoe UI", 10, "bold"))
+                mt5_state.pack(anchor="w", pady=(2, 0))
+                detail = self.ttk.Label(frame, wraplength=650)
+                detail.pack(anchor="w", pady=(2, 6))
+                controls = self.ttk.Frame(frame)
+                controls.pack(fill="x")
+                action = self.ttk.Button(controls)
+                action.pack(side="left")
+                forget = self.ttk.Button(controls, text="Disconnect & Forget")
+                forget.pack(side="right")
+                widgets = self._rendered_rows[connector_id] = {
+                    "frame": frame, "title": title, "identity": identity,
+                    "terminal_var": terminal_var, "terminal_box": terminal_box,
+                    "terminal": terminal, "backend_state": backend_state,
+                    "mt5_state": mt5_state, "detail": detail, "action": action,
+                    "forget": forget,
+                }
+            record = item["record"]
+            widgets["title"].configure(text=record.get("displayName") or "MT5 account")
+            identity_summary = item["identity"] or record.get("identitySummary", "")
+            widgets["identity"].configure(
+                text=identity_summary or f"Account ID {record['accountId']} · account identity not yet verified"
+            )
+            if not widgets["terminal_var"].get() or not self._busy_sessions.__contains__(connector_id):
+                widgets["terminal_var"].set(record.get("terminalPath", ""))
+            widgets["terminal"].configure(text=f"Terminal: {record.get('terminalPath', '')}")
+            widgets["backend_state"].configure(
+                text=f"Backend: {item['backendState']}"
+            )
+            widgets["mt5_state"].configure(
+                text=f"MT5 account: {item['mt5State']}"
+            )
+            verified_at = record.get("lastVerifiedAt")
+            verified_text = (
+                "Last verified " + time.strftime("%Y-%m-%d %H:%M", time.localtime(verified_at))
+                if verified_at else "Not yet verified"
+            )
+            widgets["detail"].configure(text=f"{item['detail']} · {verified_text}")
+            log_diagnostic(
+                "account_row_rendered",
+                connector_id,
+                status=item["status"],
+                backend_state=item["backendState"],
+                mt5_state=item["mt5State"],
+                identity_present=bool(identity_summary),
+                verified=bool(verified_at),
+                running=item["running"],
+            )
+            busy = connector_id in self._busy_sessions
+            revoked = item["status"] == "Access revoked"
+            running = item["running"]
+            widgets["action"].configure(
+                text="Stopping…" if item["status"] == "Stopping" else "Starting…" if item["status"] == "Starting" else "Stop / Disconnect" if running else "Connect",
+                state="disabled" if busy or revoked else "normal",
+                command=lambda key=connector_id, value=widgets["terminal_var"]: self._toggle_session(key, value),
+            )
+            widgets["terminal_box"].configure(state="disabled" if busy or running else "normal")
+            widgets["forget"].configure(
+                text="Forgetting…" if connector_id in self._forgetting_sessions else "Disconnect & Forget",
+                state="disabled" if busy else "normal",
+                command=lambda key=connector_id: self._forget_session(key),
+            )
+        if not snapshots:
+            if not getattr(self, "empty_label", None):
+                self.empty_label = self.ttk.Label(
+                    self.accounts_body, text="No accounts paired on this PC."
+                )
+                self.empty_label.pack(anchor="w", padx=4, pady=8)
+        elif getattr(self, "empty_label", None):
+            self.empty_label.destroy()
+            self.empty_label = None
 
     def _drain_status(self):
+        changed = False
         while True:
             try:
-                operation_id, kind, state, detail = self.status_queue.get_nowait()
+                event, key, state, detail = self.status_queue.get_nowait()
             except __import__("queue").Empty:
                 break
-            if operation_id != self._operation_id:
-                continue
-            if kind == "done":
-                self._busy = False
-                self._refresh_controls()
-                continue
-            if kind == "paired":
+            if event == "session":
+                log_diagnostic("ui_status_received", key, state=state, detail=detail)
+                changed = True
+            elif event == "session_done":
+                self._busy_sessions.discard(key)
+                changed = True
+            elif event == "forgotten":
+                self._busy_sessions.discard(key)
+                self._forgetting_sessions.discard(key)
+                changed = True
+            elif event == "forget_failed":
+                changed = True
+            elif event == "forget_finished":
+                self._busy_sessions.discard(key)
+                self._forgetting_sessions.discard(key)
+                changed = True
+            elif event == "pair_error" and key == self._operation_id:
+                self.pair_status_var.set(detail)
+            elif event == "pair_done" and key == self._operation_id:
                 self.code_var.set("")
-                self._refresh_controls()
-                continue
-            self.status_var.set(state)
-            self.detail_var.set(detail)
-            self._refresh_controls()
+                self.label_var.set("")
+                self.pair_status_var.set("Account pairing saved. Its connection state is shown below.")
+                changed = True
+            elif event == "pair_finished" and key == self._operation_id:
+                self._pairing_busy = False
+                self.pair_button.configure(state="normal", text="Pair & Connect")
+        if changed:
+            self._render_sessions()
         self.root.after(200, self._drain_status)
 
 
