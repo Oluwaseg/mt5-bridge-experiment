@@ -756,7 +756,7 @@ async def run_connection(
                     try:
                         candles = await asyncio.to_thread(
                             fetch_candles,
-                            str(payload.get("symbol", "")).upper(),
+                            str(payload.get("symbol", "")),
                             str(payload.get("timeframe", "1m")),
                             int(payload.get("count", 300)),
                             account_config,
