@@ -38,6 +38,12 @@ class DemoOrderPayloadTests(unittest.TestCase):
         self.assertEqual(order["side"], "BUY")
         self.assertEqual(order["volume"], 0.01)
 
+    def test_allows_deriv_volatility_order_with_canonical_symbol_casing(self):
+        order = validate_demo_order_payload(
+            self.valid_payload(symbol="volatility 75 (1S) index")
+        )
+        self.assertEqual(order["symbol"], "Volatility 75 (1s) Index")
+
     def test_rejects_bad_confirmation_side_symbol_and_nonfinite_volume(self):
         invalid = [
             (self.valid_payload(confirm="LIVE"), "DEMO_ONLY"),

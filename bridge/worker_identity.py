@@ -24,7 +24,35 @@ except ImportError:
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
-APPROVED_TEST_SYMBOLS = {"EURUSD", "GBPUSD", "USDJPY", "XAUUSD"}
+APPROVED_TEST_SYMBOLS = {
+    symbol.casefold(): symbol
+    for symbol in (
+        "EURUSD",
+        "GBPUSD",
+        "USDJPY",
+        "XAUUSD",
+        "Volatility 10 Index",
+        "Volatility 25 Index",
+        "Volatility 50 Index",
+        "Volatility 75 Index",
+        "Volatility 100 Index",
+        "Volatility 10 (1s) Index",
+        "Volatility 25 (1s) Index",
+        "Volatility 50 (1s) Index",
+        "Volatility 75 (1s) Index",
+        "Volatility 100 (1s) Index",
+        "Volatility 150 (1s) Index",
+        "Volatility 250 (1s) Index",
+        "Volatility 15 (1s) Index",
+        "Volatility 30 (1s) Index",
+        "Volatility 90 (1s) Index",
+        "Volatility 5 Index",
+        "Volatility 5 (1s) Index",
+        "Volatility 15 Index",
+        "Volatility 30 Index",
+        "Volatility 90 Index",
+    )
+}
 
 
 def validate_demo_order_payload(payload):
@@ -33,8 +61,9 @@ def validate_demo_order_payload(payload):
     if payload.get("confirm") != "DEMO_ONLY":
         raise ValueError("confirm must equal DEMO_ONLY")
 
-    symbol = str(payload.get("symbol", "")).upper()
-    if symbol not in APPROVED_TEST_SYMBOLS:
+    requested_symbol = str(payload.get("symbol", "")).strip()
+    symbol = APPROVED_TEST_SYMBOLS.get(requested_symbol.casefold())
+    if symbol is None:
         raise ValueError("symbol is not approved for the demo test")
 
     side = str(payload.get("side", "")).upper()

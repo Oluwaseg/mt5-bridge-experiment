@@ -663,7 +663,7 @@ def demo_order_check():
         return unauthorized
 
     payload = request.get_json(silent=True) or {}
-    symbol = str(payload.get("symbol", "EURUSD")).upper()
+    symbol = str(payload.get("symbol", "EURUSD"))
     side = str(payload.get("side", "BUY")).upper()
     volume = payload.get("volume", 0.01)
 
@@ -730,7 +730,7 @@ def demo_order_send():
     if payload.get("confirm") != "DEMO_ONLY":
         return jsonify({"error": "confirm must equal DEMO_ONLY"}), 400
 
-    symbol = str(payload.get("symbol", "EURUSD")).upper()
+    symbol = str(payload.get("symbol", "EURUSD"))
     side = str(payload.get("side", "BUY")).upper()
     volume = payload.get("volume", 0.01)
     if side not in {"BUY", "SELL"}:
